@@ -362,11 +362,8 @@ class BitcoinDataIntegrator:
         print("-> Rozwiązywanie problemu brakujących danych w weekendy (Forward Fill)...")
         self.df_main.ffill(inplace=True)
 
-        # ==========================================
-        # TUTAJ BĘDZIE MIEJSCE NA INŻYNIERIĘ CECH (Wskaźniki techniczne z użyciem bufora)
-        # ==========================================
 
-        print(f"-> Przycinanie zbioru do docelowej daty startowej modelu: {MODEL_START_DATE}...")
+        #print(f"-> Przycinanie zbioru do docelowej daty startowej modelu: {MODEL_START_DATE}...")
         # 3. Odcięcie "brudnego" okresu rozgrzewkowego. Zostawiamy czysty ML dataset.
         # self.df_main = self.df_main[self.df_main.index >= MODEL_START_DATE] # <--- USUŃ TĘ LINIĘ
         # self.df_main.dropna(inplace=True) # <--- USUŃ TĘ LINIĘ
