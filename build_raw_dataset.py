@@ -226,14 +226,16 @@ class BitcoinDataIntegrator:
 
     def get_onchain_data(self):
         """Pobiera historyczne dane On-chain z Blockchain.info API"""
-        print("-> Pobieranie danych On-Chain (Hashrate, Trudność, Adresy, Opłaty)...")
+        print("-> Pobieranie danych On-Chain (Hashrate, Trudność, Adresy, Opłaty, Mempool, Przychody)...")
 
-        # Używamy tylko stabilnych, działających endpointów
+        # PEŁNY, DOCELOWY SŁOWNIK METRYK
         charts = {
             'hash-rate': 'Hashrate',
             'difficulty': 'Difficulty',
             'n-unique-addresses': 'Unique_Addresses',
-            'transaction-fees': 'Total_Fees_BTC'
+            'transaction-fees': 'Total_Fees_BTC',
+            'mempool-size': 'Mempool_Size_Bytes',  # <--- DODANE: Zator w sieci
+            'miners-revenue': 'Miners_Revenue_USD'  # <--- DODANE: Przychody górników
         }
 
         onchain_df = pd.DataFrame()
@@ -252,7 +254,8 @@ class BitcoinDataIntegrator:
                 print(f"[!] Pominięto '{col_name}': API odrzuciło zapytanie.")
                 continue
 
-            temp_dict = {datetime.fromtimestamp(item['x']).strftime('%Y-%m-%d'): item['y'] for item in response['values']}
+            temp_dict = {datetime.fromtimestamp(item['x']).strftime('%Y-%m-%d'): item['y'] for item in
+                         response['values']}
             temp_df = pd.DataFrame.from_dict(temp_dict, orient='index', columns=[col_name])
             temp_df.index = pd.to_datetime(temp_df.index).normalize()
 
@@ -263,6 +266,75 @@ class BitcoinDataIntegrator:
 
         return onchain_df
 
+    def get_coinmetrics_data(self):
+        """Pobiera darmowe dane On-Chain z API CoinMetrics (Bloki, Transakcje)"""
+        print("-> Pobieranie darmowych metryk on-chain z CoinMetrics...")
+
+        url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+        all_data = []
+
+        # Pamiętamy o nagłówku, by serwer nie uznał nas za bota spamującego
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+
+        params = {
+            'assets': 'btc',
+            # Usunięto płatną metrykę. Zostawiamy w 100% darmowe: Bloki i Transakcje.
+            'metrics': 'BlkCnt,TxCnt',
+            'frequency': '1d',
+            'start_time': f"{FETCH_START_DATE}T00:00:00Z",
+            'end_time': f"{END_DATE}T00:00:00Z",
+            'page_size': 1000
+        }
+
+        while True:
+            try:
+                response = requests.get(url, params=params, headers=headers)
+
+                if response.status_code != 200:
+                    print(f"   [!] Błąd API CoinMetrics. Kod: {response.status_code}. Treść: {response.text}")
+                    break
+
+                json_data = response.json()
+                data_chunk = json_data.get('data', [])
+
+                if not data_chunk:
+                    break
+
+                all_data.extend(data_chunk)
+
+                next_page_token = json_data.get('next_page_token')
+                if not next_page_token:
+                    break
+
+                params['next_page_token'] = next_page_token
+                time.sleep(0.2)
+
+            except Exception as e:
+                print(f"[!] Błąd połączenia z CoinMetrics: {e}")
+                break
+
+        if not all_data:
+            print("   [!] Nie udało się pobrać żadnych danych.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_data)
+        df['date'] = pd.to_datetime(df['time']).dt.tz_localize(None).dt.normalize()
+
+        for col in ['BlkCnt', 'TxCnt']:
+            df[col] = pd.to_numeric(df.get(col), errors='coerce')
+
+        df.rename(columns={
+            'BlkCnt': 'Daily_Blocks_Mined',
+            'TxCnt': 'Daily_Transactions'
+        }, inplace=True)
+
+        final_df = df.set_index('date')[['Daily_Blocks_Mined', 'Daily_Transactions']]
+        final_df = final_df[~final_df.index.duplicated(keep='last')]
+
+        return final_df
+
     def build_dataset(self):
         """Uruchamia funkcje, łączy tabele i przygotowuje dane pod inżynierię cech"""
         print("\nROZPOCZYNAM INTEGRACJĘ DANYCH...")
@@ -272,10 +344,12 @@ class BitcoinDataIntegrator:
         fng = self.get_fear_greed()
         funding = self.get_combined_funding()
         onchain = self.get_onchain_data()
-        trends = self.get_google_trends()  # <--- NOWA METODA
+        trends = self.get_google_trends()
+        blocks = self.get_coinmetrics_data()  # <--- WYWOŁANIE NOWEJ FUNKCJI
 
         print("\n-> Łączenie zbiorów danych (Merging)...")
-        dfs = [market, macro, trends, fng, funding, onchain]  # <--- DODANO DO LISTY
+        # DODANO 'blocks' NA KONIEC LISTY DO POŁĄCZENIA
+        dfs = [market, macro, trends, fng, funding, onchain, blocks]
         self.df_main = dfs[0].join(dfs[1:], how='outer')
 
         # 1. Filtrowanie do daty pobierania buforowego (2018 rok)
