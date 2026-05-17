@@ -7,6 +7,7 @@ class BitcoinFeatureEngineer:
         self.input_filepath = input_filepath
         self.output_filepath = output_filepath
 
+        # Wczytanie danych z obsługą indeksu czasowego
         self.df = pd.read_csv(self.input_filepath, index_col=0, parse_dates=True)
         self.features_df = pd.DataFrame(index=self.df.index)
 
@@ -15,26 +16,19 @@ class BitcoinFeatureEngineer:
         delta = series.diff()
         gain = delta.where(delta > 0, 0)
         loss = -delta.where(delta < 0, 0)
-
         avg_gain = gain.ewm(alpha=1 / window, min_periods=window).mean()
         avg_loss = loss.ewm(alpha=1 / window, min_periods=window).mean()
-
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
 
     def build_price_derived_features(self):
-        """KONSOLIDACJA: Wylicza wszystkie cechy techniczne oparte na cenie BTC"""
-        print("-> Budowanie bloku cech cenowych BTC (Momentum, Grawitacja, Oscylatory, Zmienność)...")
-        if 'BTC_Price' not in self.df.columns:
-            return self
-
+        print("-> Budowanie bloku cech cenowych BTC...")
+        if 'BTC_Price' not in self.df.columns: return self
         price = self.df['BTC_Price']
 
-        # 1. Momentum
         for days in [7, 14, 28, 56]:
             self.features_df[f'BTC_Ret_{days}d'] = np.log(price / price.shift(days))
 
-        # 2. Grawitacja
         sma_50 = price.rolling(window=50).mean()
         sma_100 = price.rolling(window=100).mean()
         sma_200 = price.rolling(window=200).mean()
@@ -43,14 +37,12 @@ class BitcoinFeatureEngineer:
         self.features_df['Dist_SMA_200'] = (price / sma_200) - 1
         self.features_df['Spread_50_200'] = (sma_50 / sma_200) - 1
 
-        # 3. Oscylatory
         self.features_df['RSI_14'] = self._calculate_rsi(price, 14)
         self.features_df['RSI_28'] = self._calculate_rsi(price, 28)
         for days in [7, 14, 28, 56]:
             self.features_df[f'Dist_to_{days}d_High'] = (price / price.rolling(window=days).max()) - 1
             self.features_df[f'Dist_to_{days}d_Low'] = (price / price.rolling(window=days).min()) - 1
 
-        # 4. Zmienność
         daily_ret = np.log(price / price.shift(1))
         for days in [14, 28, 56]:
             self.features_df[f'Volatility_{days}d'] = daily_ret.rolling(window=days).std() * np.sqrt(365)
@@ -66,41 +58,30 @@ class BitcoinFeatureEngineer:
         return self
 
     def build_macro_features(self):
-        """KONSOLIDACJA: Wylicza cechy makroekonomiczne (DXY, NASDAQ, M2)"""
         print("-> Budowanie bloku cech makroekonomicznych...")
-
-        # 1. DXY
         if 'DXY_Index' in self.df.columns:
             dxy = self.df['DXY_Index']
             for days in [14, 28, 56]:
                 self.features_df[f'DXY_Ret_{days}d'] = np.log(dxy / dxy.shift(days))
-            sma_200_dxy = dxy.rolling(window=200).mean()
-            self.features_df['DXY_Dist_SMA_200'] = (dxy / sma_200_dxy) - 1
+            self.features_df['DXY_Dist_SMA_200'] = (dxy / dxy.rolling(window=200).mean()) - 1
 
-        # 2. NASDAQ
         if 'NASDAQ_100' in self.df.columns and 'BTC_Price' in self.df.columns:
             nasdaq = self.df['NASDAQ_100']
             for days in [14, 28, 56]:
                 self.features_df[f'NASDAQ_Ret_{days}d'] = np.log(nasdaq / nasdaq.shift(days))
-
             daily_ret_btc = np.log(self.df['BTC_Price'] / self.df['BTC_Price'].shift(1))
             daily_ret_nasdaq = np.log(nasdaq / nasdaq.shift(1))
             self.features_df['Corr_BTC_NASDAQ_28d'] = daily_ret_btc.rolling(window=28).corr(daily_ret_nasdaq)
             self.features_df['Corr_BTC_NASDAQ_56d'] = daily_ret_btc.rolling(window=56).corr(daily_ret_nasdaq)
 
-        # 3. M2 Supply
         if 'M2_Supply' in self.df.columns:
             m2 = self.df['M2_Supply']
             for days in [56, 168]:
                 self.features_df[f'M2_Ret_{days}d'] = np.log(m2 / m2.shift(days))
-
         return self
 
     def build_sentiment_features(self):
-        """KONSOLIDACJA: Przetwarza cechy behawioralne czystej psychologii (F&G, Google Trends)"""
-        print("-> Budowanie bloku cech sentymentu rynkowego (Fear & Greed + Google Trends)...")
-
-        # 1. FEAR & GREED INDEX
+        print("-> Budowanie bloku cech sentymentu rynkowego...")
         if 'Fear_Greed_Index' in self.df.columns:
             fg = self.df['Fear_Greed_Index']
             self.features_df['Fear_Greed_Index'] = fg
@@ -108,29 +89,145 @@ class BitcoinFeatureEngineer:
             self.features_df['F&G_Delta_14d'] = fg - fg.shift(14)
             self.features_df['F&G_Delta_28d'] = fg - fg.shift(28)
 
-        # 2. GOOGLE TRENDS BTC
         if 'Google_Trends_BTC' in self.df.columns:
             gt = self.df['Google_Trends_BTC']
             self.features_df['Google_Trends_BTC'] = gt
             self.features_df['Google_Trends_SMA_14d'] = gt.rolling(window=14).mean()
             self.features_df['Google_Trends_Delta_14d'] = gt - gt.shift(14)
             self.features_df['Google_Trends_Delta_28d'] = gt - gt.shift(28)
-
         return self
 
     def build_derivatives_features(self):
-        """NOWA METODA: Przetwarza dane z rynku instrumentów pochodnych (Futures/Perpetuals)"""
-        print("-> Budowanie bloku cech rynku derywatów (Funding Rates)...")
-
+        print("-> Budowanie bloku cech rynku derywatów...")
         if 'Funding_Rate_Last' in self.df.columns:
             funding = self.df['Funding_Rate_Last']
-
-            # 1. Surowy Funding Rate (Zachowany jako kotwica mikrostruktury)
             self.features_df['Funding_Rate_Last'] = funding
-
-            # 2. Szybki i głęboki koszt finansowania lewaryzacji (SMA 7d oraz SMA 28d)
             self.features_df['Funding_SMA_7d'] = funding.rolling(window=7).mean()
             self.features_df['Funding_SMA_28d'] = funding.rolling(window=28).mean()
+        return self
+
+    def build_volume_features(self):
+        print("-> Budowanie bloku cech wolumenowych i interakcji...")
+        if 'BTC_Volume' in self.df.columns and 'BTC_Price' in self.df.columns:
+            volume = self.df['BTC_Volume']
+            price = self.df['BTC_Price']
+            eps = 1e-8
+
+            self.features_df['Vol_Ret_7d'] = np.log((volume + eps) / (volume.shift(7) + eps))
+            self.features_df['Vol_Ret_28d'] = np.log((volume + eps) / (volume.shift(28) + eps))
+
+            sma_14_vol = volume.rolling(window=14).mean()
+            sma_28_vol = volume.rolling(window=28).mean()
+            self.features_df['Vol_Ratio_to_SMA_14d'] = np.where(sma_14_vol == 0, 0, (volume / sma_14_vol) - 1)
+            self.features_df['Vol_Ratio_to_SMA_28d'] = np.where(sma_28_vol == 0, 0, (volume / sma_28_vol) - 1)
+
+            daily_ret_btc = np.log(price / price.shift(1))
+            self.features_df['Signed_Vol_Ratio'] = self.features_df['Vol_Ratio_to_SMA_14d'] * np.sign(daily_ret_btc)
+
+            if 'BB_Percent_28d' in self.features_df.columns:
+                self.features_df['BB_Vol_Pressure'] = self.features_df['Vol_Ratio_to_SMA_14d'] * (
+                            self.features_df['BB_Percent_28d'] - 0.5)
+            if 'Volatility_14d' in self.features_df.columns:
+                self.features_df['Vol_Climax_Index'] = self.features_df['Vol_Ratio_to_SMA_14d'] * self.features_df[
+                    'Volatility_14d']
+        return self
+
+    def build_onchain_features(self):
+        """KONSOLIDACJA: Przetwarza dane on-chain (Górnicy, Adopcja, Opłaty Sieciowe)"""
+        print("-> Budowanie bloku cech on-chain (Górnicy, Adresy, Opłaty)...")
+        eps = 1e-8  # Zabezpieczenie przed dzieleniem przez zero
+
+        # --- 1. GÓRNICY (Hashrate & Difficulty) ---
+        if 'Hashrate' in self.df.columns and 'Difficulty' in self.df.columns:
+            hashrate = self.df['Hashrate']
+            difficulty = self.df['Difficulty']
+
+            sma_30_hash = hashrate.rolling(window=30).mean()
+            sma_60_hash = hashrate.rolling(window=60).mean()
+            self.features_df['Hash_Compression'] = np.where(sma_60_hash == 0, 0, (sma_30_hash / sma_60_hash) - 1)
+
+            ratio = hashrate / difficulty
+            self.features_df['Hash_Diff_Ratio'] = ratio.rolling(window=7).mean()
+
+        # --- 2. ADOPCJA I AKTYWNOŚĆ (Unique Addresses & Transactions) ---
+        if 'Unique_Addresses' in self.df.columns and 'Daily_Transactions' in self.df.columns and 'BTC_Price' in self.df.columns:
+            addr = self.df['Unique_Addresses']
+            tx = self.df['Daily_Transactions']
+            price = self.df['BTC_Price']
+
+            # Dywergencja Cenowo-Adresowa (Różnica dynamiki z 28 dni)
+            price_ret_28 = np.log(price / price.shift(28))
+            addr_ret_28 = np.log((addr + eps) / (addr.shift(28) + eps))
+            self.features_df['Price_Address_Divergence_28d'] = price_ret_28 - addr_ret_28
+
+            # Z-Score Aktywności Sieci (Anomalia z 56 dni)
+            sma_56_addr = addr.rolling(window=56).mean()
+            std_56_addr = addr.rolling(window=56).std()
+            self.features_df['Network_Hype_ZScore_56d'] = np.where(std_56_addr == 0, 0,
+                                                                   (addr - sma_56_addr) / std_56_addr)
+
+            # Wskaźnik Spekulacyjnej Gęstości
+            tx_per_addr = tx / (addr + eps)
+            self.features_df['Tx_per_Address_SMA_7d'] = tx_per_addr.rolling(window=7).mean()
+
+        # --- 3. OPŁATY SIECIOWE I ZATORY (Fees & Urgency) ---
+        if 'Total_Fees_BTC' in self.df.columns and 'Miners_Revenue_USD' in self.df.columns and 'Daily_Transactions' in self.df.columns:
+            fees_btc = self.df['Total_Fees_BTC']
+            revenue_usd = self.df['Miners_Revenue_USD']
+            tx = self.df['Daily_Transactions']
+            price = self.df['BTC_Price']
+
+            # A. Wskaźnik Presji Opłat (Fee-to-Revenue Ratio wygładzony 7-dniową średnią)
+            fees_usd = fees_btc * price
+            fee_to_revenue = fees_usd / (revenue_usd + eps)
+            self.features_df['Fee_to_Revenue_Ratio_7d'] = fee_to_revenue.rolling(window=7).mean()
+
+            # B. Koszt Pośpiechu: Z-Score średniej opłaty za transakcję (Z okna 56 dni)
+            avg_fee_per_tx = fees_btc / (tx + eps)
+            sma_56_fee = avg_fee_per_tx.rolling(window=56).mean()
+            std_56_fee = avg_fee_per_tx.rolling(window=56).std()
+            self.features_df['Fee_Urgency_ZScore_56d'] = np.where(std_56_fee == 0, 0,
+                                                                  (avg_fee_per_tx - sma_56_fee) / std_56_fee)
+
+        return self
+
+    def build_halving_features(self):
+        """NOWA METODA: Tworzy Zegar Makroekonomiczny oparty na cyklach Halvingu Bitcoina"""
+        print("-> Budowanie bloku cykli Halvingowych (Kodowanie cykliczne)...")
+
+        if 'Daily_Blocks_Mined' in self.df.columns:
+            # 1. Odtworzenie całkowitej liczby wykopanych bloków (Total Blocks)
+            # Kotwica od użytkownika: 11 maja 2020 na koniec dnia było 630 027 bloków
+            anchor_date = pd.to_datetime('2020-05-11')
+            anchor_blocks = 630027
+
+            # Zabezpieczenie: jeśli w datach nie ma 2020-05-11 (co jest mało prawdopodobne), szukamy najbliższej daty
+            if anchor_date not in self.df.index:
+                anchor_date = self.df.index[self.df.index.get_indexer([anchor_date], method='nearest')[0]]
+
+            # Obliczamy skumulowaną sumę bloków w całym pliku
+            cumsum_blocks = self.df['Daily_Blocks_Mined'].cumsum()
+
+            # Różnica między naszą kotwicą a wartością z cumsum w tym dniu daje nam bazowy offset
+            base_offset = anchor_blocks - cumsum_blocks.loc[anchor_date]
+
+            # Właściwa całkowita liczba bloków dla każdego dnia
+            self.features_df['Total_Blocks'] = cumsum_blocks + base_offset
+
+            # 2. Obliczenie postępu cyklu Halvingowego (Halving co 210 000 bloków)
+            cycle_length = 210000
+            blocks_since_halving = self.features_df['Total_Blocks'] % cycle_length
+
+            # Procent cyklu (od 0.0 do 1.0) - model z tego wyciągnie trend
+            self.features_df['Halving_Progress'] = blocks_since_halving / cycle_length
+
+            # 3. Kodowanie cykliczne (Sin/Cos) - chroni przed skokiem 0.99 -> 0.0 w dniu halvingu
+            # Zamienia cykl liniowy w okrąg (jak tarcza zegara)
+            self.features_df['Halving_Sin'] = np.sin(2 * np.pi * self.features_df['Halving_Progress'])
+            self.features_df['Halving_Cos'] = np.cos(2 * np.pi * self.features_df['Halving_Progress'])
+
+            # Opcjonalnie usuwamy 'Total_Blocks', by nie tworzyć niestacjonarnego trendu rosnącego w nieskończoność
+            self.features_df.drop(columns=['Total_Blocks'], inplace=True)
 
         return self
 
@@ -143,12 +240,13 @@ class BitcoinFeatureEngineer:
         print(f"-> Zapisywanie gotowej macierzy cech do pliku: {self.output_filepath}")
         self.features_df.to_csv(self.output_filepath)
 
-        print("\n--- PODGLĄD METRYK RYNKU DERYWATÓW ---")
-        cols_to_show = ['Funding_Rate_Last', 'Funding_SMA_7d', 'Funding_SMA_28d']
+        print("\n--- PODGLĄD METRYK GORĄCZKI SIECIOWEJ ---")
+        cols_to_show = ['Fee_to_Revenue_Ratio_7d', 'Fee_Urgency_ZScore_56d']
         if all(col in self.features_df.columns for col in cols_to_show):
             print(self.features_df[cols_to_show].head())
 
-        print(f"\nRozmiar nowego zbioru: {self.features_df.shape[1]} kolumn, {self.features_df.shape[0]} wierszy.")
+        print(
+            f"\nRozmiar OSTATECZNEGO zbioru: {self.features_df.shape[1]} kolumn, {self.features_df.shape[0]} wierszy.")
         return self.features_df
 
     def run_pipeline(self):
@@ -156,11 +254,17 @@ class BitcoinFeatureEngineer:
         (self.build_price_derived_features()
          .build_macro_features()
          .build_sentiment_features()
-         .build_derivatives_features()  # <--- Wpięcie nowego dedykowanego modułu
+         .build_derivatives_features()
+         .build_volume_features()
+         .build_onchain_features()
+         .build_halving_features()  # <--- Dodane tutaj
          .save_features())
         return self.features_df
 
 
+# ==========================================
+# URUCHOMIENIE SKRYPTU
+# ==========================================
 if __name__ == "__main__":
     engineer = BitcoinFeatureEngineer('btc_ensemble_features.csv', 'btc_ml_features.csv')
     ml_dataset = engineer.run_pipeline()
