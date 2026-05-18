@@ -9,7 +9,7 @@ import time
 # KONFIGURACJA GŁÓWNA
 # ==========================================
 FRED_API_KEY = 'f3ac7094f956fdb519c4f98c2453e476'
-FETCH_START_DATE = '2017-07-01'  # 7 miesięcy bufora przed modelem (na wyliczenie SMA 200)
+FETCH_START_DATE = '2011-01-01'  # 7 miesięcy bufora przed modelem (na wyliczenie SMA 200)
 MODEL_START_DATE = '2018-02-01'  # Start modelu (Zbiega się z powstaniem Fear & Greed Index!)
 END_DATE = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
@@ -20,23 +20,32 @@ class BitcoinDataIntegrator:
         self.df_main = pd.DataFrame()
 
     def get_market_data(self):
-        """Pobiera dane Spot i Makro (Cena, Wolumen, DXY, NASDAQ) z Yahoo Finance"""
-        print("-> Pobieranie danych z Yahoo Finance...")
-        tickers = {
-            'BTC-USD': 'BTC_Price',
-            '^IXIC': 'NASDAQ_100',
-            'DX-Y.NYB': 'DXY_Index'
-        }
+        """Pobiera dane Spot (OHLCV dla BTC) i Makro (Cena zamknięcia DXY, NASDAQ, Złoto, Ropa WTI) z Yahoo Finance"""
+        print("-> Pobieranie danych z Yahoo Finance (w tym OHLC dla BTC oraz ceny Złota i Ropy WTI)...")
+        tickers = ['BTC-USD', '^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F']
 
         # Pobieranie danych (używamy daty buforowej)
-        data = yf.download(list(tickers.keys()), start=FETCH_START_DATE, end=END_DATE)
+        data = yf.download(tickers, start=FETCH_START_DATE, end=END_DATE)
 
-        # Ekstrakcja cen zamknięcia i wolumenu (tylko dla BTC)
-        close_prices = data['Close'].rename(columns=tickers)
-        btc_volume = data['Volume'][['BTC-USD']].rename(columns={'BTC-USD': 'BTC_Volume'})
+        # Ekstrakcja danych makro (tylko ceny zamknięcia - Close)
+        macro_df = data['Close'][['^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F']].rename(columns={
+            '^IXIC': 'NASDAQ_100',
+            'DX-Y.NYB': 'DXY_Index',
+            'GC=F': 'Gold_Close',
+            'CL=F': 'WTI_Oil_Close'
+        })
+
+        # Ekstrakcja pełnego OHLCV dla Bitcoina
+        btc_ohlcv = pd.DataFrame({
+            'BTC_Open': data['Open']['BTC-USD'],
+            'BTC_High': data['High']['BTC-USD'],
+            'BTC_Low': data['Low']['BTC-USD'],
+            'BTC_Close': data['Close']['BTC-USD'],
+            'BTC_Volume': data['Volume']['BTC-USD']
+        })
 
         # Łączenie w jeden DataFrame
-        market_df = pd.concat([close_prices, btc_volume], axis=1)
+        market_df = pd.concat([btc_ohlcv, macro_df], axis=1)
         market_df.index = pd.to_datetime(market_df.index).normalize()
         return market_df
 
@@ -71,40 +80,31 @@ class BitcoinDataIntegrator:
     def get_google_trends(self):
         """Pobiera historyczne zainteresowanie słowem 'Bitcoin' z Google Trends"""
         print("-> Pobieranie danych z Google Trends (Sentyment wyszukiwań)...")
-        from pytrends.request import TrendReq  # Importujemy lokalnie, by zachować porządek
+        from pytrends.request import TrendReq
 
         try:
-            # Inicjalizacja klienta. Używamy strefy czasowej UTC (tz=0)
             pytrends = TrendReq(hl='en-US', tz=0)
-
-            # Słowo kluczowe
             kw_list = ["Bitcoin"]
-
-            # Budowa zapytania z naszymi datami z konfiguracji
             timeframe = f"{FETCH_START_DATE} {END_DATE}"
             pytrends.build_payload(kw_list, cat=0, timeframe=timeframe, geo='', gprop='')
 
-            # Pobranie danych
             trends_df = pytrends.interest_over_time()
 
             if trends_df.empty:
                 print("[!] Google Trends zwróciło pusty zbiór. Być może nałożono limit (Rate Limit).")
                 return pd.DataFrame()
 
-            # Usunięcie zbędnej kolumny systemowej 'isPartial' jeśli istnieje
             if 'isPartial' in trends_df.columns:
                 trends_df = trends_df.drop(columns=['isPartial'])
 
             trends_df.columns = ['Google_Trends_BTC']
             trends_df.index = pd.to_datetime(trends_df.index).normalize()
 
-            # SKALOWANIE: Google zwraca dane tygodniowe.
-            # Rozbijamy je na codzienne (resample) i kopiujemy wartość na kolejne dni tygodnia (ffill)
             daily_trends = trends_df.resample('D').ffill()
             return daily_trends
 
         except Exception as e:
-            print(f"[!] Błąd API Google Trends (najczęściej blokada IP/Too Many Requests): {e}")
+            print(f"[!] Błąd API Google Trends: {e}")
             return pd.DataFrame()
 
     def get_bitmex_funding(self, start_date, end_date):
@@ -112,7 +112,6 @@ class BitcoinDataIntegrator:
         print("-> Pobieranie historii Funding Rate z BitMEX...")
         all_funding_dfs = []
 
-        # Pandas automatycznie radzi sobie z formatami dat
         current_start = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
 
@@ -139,26 +138,21 @@ class BitcoinDataIntegrator:
                 if not data:
                     break
 
-                # Konwersja paczki danych prosto do Pandas DataFrame
                 temp_df = pd.DataFrame(data)
-
-                # Zmiana tekstowych timestampów na obiekty daty i usunięcie strefy czasowej (dla kompatybilności z Binance)
                 temp_df['timestamp'] = pd.to_datetime(temp_df['timestamp']).dt.tz_localize(None)
 
-                # Wektorowe odfiltrowanie danych nowszych niż nasza data końcowa
                 filtered_df = temp_df[temp_df['timestamp'] < end_dt]
 
                 if not filtered_df.empty:
                     all_funding_dfs.append(filtered_df)
 
-                # Wyciągnięcie ostatniego czasu jako punktu startowego do kolejnej pętli
                 last_ts = temp_df['timestamp'].iloc[-1]
 
                 if last_ts <= current_start or len(data) < 500:
                     break
 
                 current_start = last_ts + pd.Timedelta(seconds=1)
-                time.sleep(1.5)  # Opóźnienie zapobiegające błędom 429
+                time.sleep(1.5)
 
             except Exception as e:
                 print(f"[!] Błąd przetwarzania danych BitMEX: {e}")
@@ -168,11 +162,8 @@ class BitcoinDataIntegrator:
             print("[!] Nie udało się pobrać żadnych danych z BitMEX.")
             return pd.DataFrame()
 
-        # Połączenie wszystkich małych tabelek w jedną wielką
         df = pd.concat(all_funding_dfs, ignore_index=True)
         df['date'] = df['timestamp'].dt.normalize()
-
-        # Wyciągamy ostatni odczyt z każdego dnia
         daily_funding = df.groupby('date')['fundingRate'].last().to_frame()
         return daily_funding
 
@@ -213,14 +204,12 @@ class BitcoinDataIntegrator:
         """Łączy dane z BitMEX (starsze) oraz Binance (nowsze) w jedną spójną serię"""
         print("\n-> Integracja finansowania na rynku derywatów (BitMEX + Binance)...")
 
-        # Binance odpaliło futures 10 września 2019
         bitmex_df = self.get_bitmex_funding(FETCH_START_DATE, '2019-09-10')
         binance_df = self.get_binance_funding('2019-09-10', END_DATE)
 
         combined_df = pd.concat([bitmex_df, binance_df])
         combined_df.columns = ['Funding_Rate_Last']
 
-        # Zabezpieczenie na wypadek dubli przy zmianie giełdy
         combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
         return combined_df
 
@@ -228,14 +217,13 @@ class BitcoinDataIntegrator:
         """Pobiera historyczne dane On-chain z Blockchain.info API"""
         print("-> Pobieranie danych On-Chain (Hashrate, Trudność, Adresy, Opłaty, Mempool, Przychody)...")
 
-        # PEŁNY, DOCELOWY SŁOWNIK METRYK
         charts = {
             'hash-rate': 'Hashrate',
             'difficulty': 'Difficulty',
             'n-unique-addresses': 'Unique_Addresses',
             'transaction-fees': 'Total_Fees_BTC',
-            'mempool-size': 'Mempool_Size_Bytes',  # <--- DODANE: Zator w sieci
-            'miners-revenue': 'Miners_Revenue_USD'  # <--- DODANE: Przychody górników
+            'mempool-size': 'Mempool_Size_Bytes',
+            'miners-revenue': 'Miners_Revenue_USD'
         }
 
         onchain_df = pd.DataFrame()
@@ -267,21 +255,20 @@ class BitcoinDataIntegrator:
         return onchain_df
 
     def get_coinmetrics_data(self):
-        """Pobiera darmowe dane On-Chain z API CoinMetrics (Bloki, Transakcje)"""
+        """Pobiera darmowe dane On-Chain z API CoinMetrics (Bloki, Transakcje, Aktywne Adresy)"""
         print("-> Pobieranie darmowych metryk on-chain z CoinMetrics...")
 
         url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
         all_data = []
 
-        # Pamiętamy o nagłówku, by serwer nie uznał nas za bota spamującego
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
 
         params = {
             'assets': 'btc',
-            # Usunięto płatną metrykę. Zostawiamy w 100% darmowe: Bloki i Transakcje.
-            'metrics': 'BlkCnt,TxCnt',
+            # DODANO: AdrActCnt (Active Addresses Count)
+            'metrics': 'BlkCnt,TxCnt,AdrActCnt',
             'frequency': '1d',
             'start_time': f"{FETCH_START_DATE}T00:00:00Z",
             'end_time': f"{END_DATE}T00:00:00Z",
@@ -293,7 +280,7 @@ class BitcoinDataIntegrator:
                 response = requests.get(url, params=params, headers=headers)
 
                 if response.status_code != 200:
-                    print(f"   [!] Błąd API CoinMetrics. Kod: {response.status_code}. Treść: {response.text}")
+                    print(f"   [!] Błąd API CoinMetrics. Kod: {response.status_code}.")
                     break
 
                 json_data = response.json()
@@ -322,15 +309,18 @@ class BitcoinDataIntegrator:
         df = pd.DataFrame(all_data)
         df['date'] = pd.to_datetime(df['time']).dt.tz_localize(None).dt.normalize()
 
-        for col in ['BlkCnt', 'TxCnt']:
+        # Konwersja wszystkich pobranych metryk na wartości numeryczne
+        for col in ['BlkCnt', 'TxCnt', 'AdrActCnt']:
             df[col] = pd.to_numeric(df.get(col), errors='coerce')
 
+        # Zmiana nazw kolumn na czytelne dla modelu
         df.rename(columns={
             'BlkCnt': 'Daily_Blocks_Mined',
-            'TxCnt': 'Daily_Transactions'
+            'TxCnt': 'Daily_Transactions',
+            'AdrActCnt': 'Active_Addresses_CM'  # <--- DODANA NAZWA KOLUMNY
         }, inplace=True)
 
-        final_df = df.set_index('date')[['Daily_Blocks_Mined', 'Daily_Transactions']]
+        final_df = df.set_index('date')[['Daily_Blocks_Mined', 'Daily_Transactions', 'Active_Addresses_CM']]
         final_df = final_df[~final_df.index.duplicated(keep='last')]
 
         return final_df
@@ -345,28 +335,20 @@ class BitcoinDataIntegrator:
         funding = self.get_combined_funding()
         onchain = self.get_onchain_data()
         trends = self.get_google_trends()
-        blocks = self.get_coinmetrics_data()  # <--- WYWOŁANIE NOWEJ FUNKCJI
+        blocks = self.get_coinmetrics_data()
 
         print("\n-> Łączenie zbiorów danych (Merging)...")
-        # DODANO 'blocks' NA KONIEC LISTY DO POŁĄCZENIA
         dfs = [market, macro, trends, fng, funding, onchain, blocks]
+
         self.df_main = dfs[0].join(dfs[1:], how='outer')
-
-        # 1. Filtrowanie do daty pobierania buforowego (2018 rok)
-        self.df_main = self.df_main[self.df_main.index >= FETCH_START_DATE]
-        self.df_main = self.df_main[self.df_main.index <= END_DATE]
-
-        # 2. ZABEZPIECZENIE: Usuwanie wiersza dla wczoraj, jeśli Yahoo nie dało jeszcze ceny
-        self.df_main.dropna(subset=['BTC_Price'], inplace=True)
 
         print("-> Rozwiązywanie problemu brakujących danych w weekendy (Forward Fill)...")
         self.df_main.ffill(inplace=True)
 
+        self.df_main = self.df_main[self.df_main.index >= FETCH_START_DATE]
+        self.df_main = self.df_main[self.df_main.index <= END_DATE]
 
-        #print(f"-> Przycinanie zbioru do docelowej daty startowej modelu: {MODEL_START_DATE}...")
-        # 3. Odcięcie "brudnego" okresu rozgrzewkowego. Zostawiamy czysty ML dataset.
-        # self.df_main = self.df_main[self.df_main.index >= MODEL_START_DATE] # <--- USUŃ TĘ LINIĘ
-        # self.df_main.dropna(inplace=True) # <--- USUŃ TĘ LINIĘ
+        self.df_main.dropna(subset=['BTC_Close'], inplace=True)
 
         print("\nGOTOWE! Zestawienie pierwszych 5 rekordów dla Modelu:")
         print(self.df_main.head())
