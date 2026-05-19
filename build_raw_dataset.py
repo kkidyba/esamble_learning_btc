@@ -255,7 +255,7 @@ class BitcoinDataIntegrator:
         return onchain_df
 
     def get_coinmetrics_data(self):
-        """Pobiera darmowe dane On-Chain z API CoinMetrics (Bloki, Transakcje, Aktywne Adresy)"""
+        """Pobiera darmowe dane On-Chain z API CoinMetrics (Bloki, Transakcje, Aktywne Adresy, Surowa Emisja)"""
         print("-> Pobieranie darmowych metryk on-chain z CoinMetrics...")
 
         url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
@@ -267,8 +267,8 @@ class BitcoinDataIntegrator:
 
         params = {
             'assets': 'btc',
-            # DODANO: AdrActCnt (Active Addresses Count)
-            'metrics': 'BlkCnt,TxCnt,AdrActCnt',
+            # DODANO: IssTotUSD (Surowa wartość nowej emisji BTC w USD)
+            'metrics': 'BlkCnt,TxCnt,AdrActCnt,IssTotUSD',
             'frequency': '1d',
             'start_time': f"{FETCH_START_DATE}T00:00:00Z",
             'end_time': f"{END_DATE}T00:00:00Z",
@@ -303,24 +303,26 @@ class BitcoinDataIntegrator:
                 break
 
         if not all_data:
-            print("   [!] Nie udało się pobrać żadnych danych.")
+            print("   [!] Nie udało się pobrać żadnych danych z CoinMetrics.")
             return pd.DataFrame()
 
         df = pd.DataFrame(all_data)
         df['date'] = pd.to_datetime(df['time']).dt.tz_localize(None).dt.normalize()
 
         # Konwersja wszystkich pobranych metryk na wartości numeryczne
-        for col in ['BlkCnt', 'TxCnt', 'AdrActCnt']:
+        for col in ['BlkCnt', 'TxCnt', 'AdrActCnt', 'IssTotUSD']:
             df[col] = pd.to_numeric(df.get(col), errors='coerce')
 
-        # Zmiana nazw kolumn na czytelne dla modelu
+        # Zmiana nazw kolumn na surowe nazwy czytelne dla modelu
         df.rename(columns={
             'BlkCnt': 'Daily_Blocks_Mined',
             'TxCnt': 'Daily_Transactions',
-            'AdrActCnt': 'Active_Addresses_CM'  # <--- DODANA NAZWA KOLUMNY
+            'AdrActCnt': 'Active_Addresses_CM',
+            'IssTotUSD': 'Daily_Issuance_USD'  # <--- SUROWE DANE DOSTAWIONE DO CSV
         }, inplace=True)
 
-        final_df = df.set_index('date')[['Daily_Blocks_Mined', 'Daily_Transactions', 'Active_Addresses_CM']]
+        final_df = df.set_index('date')[
+            ['Daily_Blocks_Mined', 'Daily_Transactions', 'Active_Addresses_CM', 'Daily_Issuance_USD']]
         final_df = final_df[~final_df.index.duplicated(keep='last')]
 
         return final_df
@@ -353,7 +355,7 @@ class BitcoinDataIntegrator:
         print("\nGOTOWE! Zestawienie pierwszych 5 rekordów dla Modelu:")
         print(self.df_main.head())
 
-        filename = 'btc_ensemble_features.csv'
+        filename = 'btc_raw_data.csv'
         self.df_main.to_csv(filename)
         print(f"\nZapisano pełny zbiór danych do pliku: {filename}")
 
