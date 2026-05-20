@@ -5,11 +5,12 @@ import requests
 from datetime import datetime, timedelta
 import time
 
+
 # ==========================================
 # KONFIGURACJA GŁÓWNA
 # ==========================================
 FRED_API_KEY = 'f3ac7094f956fdb519c4f98c2453e476'
-FETCH_START_DATE = '2011-01-01'  # 7 miesięcy bufora przed modelem (na wyliczenie SMA 200)
+FETCH_START_DATE = '2011-01-01'
 MODEL_START_DATE = '2018-02-01'  # Start modelu (Zbiega się z powstaniem Fear & Greed Index!)
 END_DATE = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
@@ -213,17 +214,41 @@ class BitcoinDataIntegrator:
         combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
         return combined_df
 
-    def get_onchain_data(self):
-        """Pobiera historyczne dane On-chain z Blockchain.info API"""
-        print("-> Pobieranie danych On-Chain (Hashrate, Trudność, Adresy, Opłaty, Mempool, Przychody)...")
 
+    def get_blockchaininfo_data(self):
+        """Pobiera historyczne, surowe dane On-chain z Blockchain.info API"""
+        print("-> Pobieranie surowych danych On-Chain...")
+
+        # Słownik zawiera wyłącznie faktycznie istniejące endpointy zwracające surowe wartości
         charts = {
+            # 1. Górnictwo i Bezpieczeństwo Sieci
             'hash-rate': 'Hashrate',
             'difficulty': 'Difficulty',
-            'n-unique-addresses': 'Unique_Addresses',
-            'transaction-fees': 'Total_Fees_BTC',
+            'miners-revenue': 'Miners_Revenue_USD',
+
+            # 2. Mempool i Przepustowość
             'mempool-size': 'Mempool_Size_Bytes',
-            'miners-revenue': 'Miners_Revenue_USD'
+            'mempool-count': 'Mempool_Tx_Count',
+            'median-confirmation-time': 'Median_Conf_Time',
+
+            # 3. Aktywność Transakcyjna
+            'n-transactions': 'Tx_Count',
+            'n-transactions-excluding-popular': 'Tx_Retail_Count',
+            'n-transactions-per-block': 'Avg_Tx_Per_Block',
+            'estimated-transaction-volume': 'Est_Tx_Volume_BTC',
+            'avg-block-size': 'Avg_Block_Size_MB',
+
+            # 4. Opłaty i Koszty
+            'transaction-fees': 'Total_Fees_BTC',
+            'cost-per-transaction-percent': 'Cost_Per_Tx_Percent',
+
+            # 5. Użytkownicy i Stan Księgi
+            'n-unique-addresses': 'Unique_Addresses',
+            'utxo-count': 'UTXO_Count',
+
+            # 6. Rynek i Podaż
+            'total-bitcoins': 'Circulating_Supply',
+            'trade-volume': 'Exchange_Trade_Volume_USD',
         }
 
         onchain_df = pd.DataFrame()
@@ -232,18 +257,19 @@ class BitcoinDataIntegrator:
             url = f"https://api.blockchain.info/charts/{endpoint}?timespan=all&sampled=true&format=json"
 
             try:
-                response_raw = requests.get(url)
+                response_raw = requests.get(url, timeout=10)
+                response_raw.raise_for_status()
                 response = response_raw.json()
             except Exception as e:
-                print(f"[!] Błąd połączenia dla {col_name}: {e}")
+                print(f"[!] Błąd pobierania dla {col_name}: {e}")
                 continue
 
             if 'values' not in response:
-                print(f"[!] Pominięto '{col_name}': API odrzuciło zapytanie.")
+                print(f"[!] Pominięto '{col_name}': Brak klucza 'values' w odpowiedzi.")
                 continue
 
-            temp_dict = {datetime.fromtimestamp(item['x']).strftime('%Y-%m-%d'): item['y'] for item in
-                         response['values']}
+            temp_dict = {datetime.fromtimestamp(item['x']).strftime('%Y-%m-%d'): item['y']
+                         for item in response['values']}
             temp_df = pd.DataFrame.from_dict(temp_dict, orient='index', columns=[col_name])
             temp_df.index = pd.to_datetime(temp_df.index).normalize()
 
@@ -251,6 +277,9 @@ class BitcoinDataIntegrator:
                 onchain_df = temp_df
             else:
                 onchain_df = onchain_df.join(temp_df, how='outer')
+
+        onchain_df.sort_index(inplace=True)
+        onchain_df.ffill(inplace=True)
 
         return onchain_df
 
@@ -310,19 +339,17 @@ class BitcoinDataIntegrator:
         df['date'] = pd.to_datetime(df['time']).dt.tz_localize(None).dt.normalize()
 
         # Konwersja wszystkich pobranych metryk na wartości numeryczne
-        for col in ['BlkCnt', 'TxCnt', 'AdrActCnt', 'IssTotUSD']:
+        for col in ['BlkCnt', 'IssTotUSD']:
             df[col] = pd.to_numeric(df.get(col), errors='coerce')
 
         # Zmiana nazw kolumn na surowe nazwy czytelne dla modelu
         df.rename(columns={
             'BlkCnt': 'Daily_Blocks_Mined',
-            'TxCnt': 'Daily_Transactions',
-            'AdrActCnt': 'Active_Addresses_CM',
             'IssTotUSD': 'Daily_Issuance_USD'  # <--- SUROWE DANE DOSTAWIONE DO CSV
         }, inplace=True)
 
         final_df = df.set_index('date')[
-            ['Daily_Blocks_Mined', 'Daily_Transactions', 'Active_Addresses_CM', 'Daily_Issuance_USD']]
+            ['Daily_Blocks_Mined', 'Daily_Issuance_USD']]
         final_df = final_df[~final_df.index.duplicated(keep='last')]
 
         return final_df
@@ -335,12 +362,20 @@ class BitcoinDataIntegrator:
         macro = self.get_macro_data()
         fng = self.get_fear_greed()
         funding = self.get_combined_funding()
-        onchain = self.get_onchain_data()
+        onchain = self.get_blockchaininfo_data()
         trends = self.get_google_trends()
         blocks = self.get_coinmetrics_data()
 
         print("\n-> Łączenie zbiorów danych (Merging)...")
-        dfs = [market, macro, trends, fng, funding, onchain, blocks]
+        dfs = [
+            market,
+            macro,
+            trends,
+            fng,
+            funding,
+            onchain,
+            blocks
+            ]
 
         self.df_main = dfs[0].join(dfs[1:], how='outer')
 
