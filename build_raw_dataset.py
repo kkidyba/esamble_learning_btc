@@ -10,8 +10,8 @@ import time
 # KONFIGURACJA GŁÓWNA
 # ==========================================
 FRED_API_KEY = 'f3ac7094f956fdb519c4f98c2453e476'
-FETCH_START_DATE = '2011-01-01'
-MODEL_START_DATE = '2018-02-01'  # Start modelu (Zbiega się z powstaniem Fear & Greed Index!)
+FETCH_START_DATE = '2014-09-01'
+MODEL_START_DATE = '2014-09-01'  # Start modelu (Zbiega się z powstaniem Fear & Greed Index!)
 END_DATE = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
 
@@ -20,20 +20,22 @@ class BitcoinDataIntegrator:
         self.fred = Fred(api_key=FRED_API_KEY)
         self.df_main = pd.DataFrame()
 
-    def get_market_data(self):
+    def get_yahoo_data(self):
         """Pobiera dane Spot (OHLCV dla BTC) i Makro (Cena zamknięcia DXY, NASDAQ, Złoto, Ropa WTI) z Yahoo Finance"""
         print("-> Pobieranie danych z Yahoo Finance (w tym OHLC dla BTC oraz ceny Złota i Ropy WTI)...")
-        tickers = ['BTC-USD', '^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F']
+        tickers = ['BTC-USD', '^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F', '^VIX', '^TNX']
 
         # Pobieranie danych (używamy daty buforowej)
         data = yf.download(tickers, start=FETCH_START_DATE, end=END_DATE)
 
         # Ekstrakcja danych makro (tylko ceny zamknięcia - Close)
-        macro_df = data['Close'][['^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F']].rename(columns={
+        macro_df = data['Close'][['^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F', '^VIX', '^TNX']].rename(columns={
             '^IXIC': 'NASDAQ_100',
             'DX-Y.NYB': 'DXY_Index',
             'GC=F': 'Gold_Close',
-            'CL=F': 'WTI_Oil_Close'
+            'CL=F': 'WTI_Oil_Close',
+            '^VIX': 'VIX_Index',
+            '^TNX': 'TNX'
         })
 
         # Ekstrakcja pełnego OHLCV dla Bitcoina
@@ -51,15 +53,29 @@ class BitcoinDataIntegrator:
         return market_df
 
     def get_macro_data(self):
-        """Pobiera podaż pieniądza M2 z FRED"""
-        print("-> Pobieranie podaży pieniądza M2 z FRED...")
+        """Pobiera dane makroekonomiczne z FRED (M2, Stopy procentowe, Inflacja)"""
+        print("-> Pobieranie danych makro z FRED (M2, FEDFUNDS, Core CPI)...")
         try:
+            # 1. Podaż pieniądza M2 (M2SL)
             m2_data = self.fred.get_series('M2SL', observation_start=FETCH_START_DATE)
             m2_df = pd.DataFrame(m2_data, columns=['M2_Supply'])
-            m2_df.index = pd.to_datetime(m2_df.index).normalize()
-            return m2_df
+
+            # 2. Stopy procentowe FED (FEDFUNDS)
+            fed_data = self.fred.get_series('FEDFUNDS', observation_start=FETCH_START_DATE)
+            fed_df = pd.DataFrame(fed_data, columns=['FEDFUNDS_Rate'])
+
+            # 3. Inflacja bazowa (Core CPI - bez żywności i energii - CPILFESL)
+            cpi_data = self.fred.get_series('CPILFESL', observation_start=FETCH_START_DATE)
+            cpi_df = pd.DataFrame(cpi_data, columns=['Core_CPI'])
+
+            # Łączenie w jeden DataFrame za pomocą join (dane miesięczne)
+            macro_df = m2_df.join([fed_df, cpi_df], how='outer')
+            macro_df.index = pd.to_datetime(macro_df.index).normalize()
+
+            return macro_df
+
         except Exception as e:
-            print(f"Błąd FRED API: {e}")
+            print(f"[!] Błąd FRED API: {e}")
             return pd.DataFrame()
 
     def get_fear_greed(self):
@@ -108,7 +124,7 @@ class BitcoinDataIntegrator:
             print(f"[!] Błąd API Google Trends: {e}")
             return pd.DataFrame()
 
-    def get_bitmex_funding(self, start_date, end_date):
+    def get_bitmex_data(self, start_date, end_date):
         """Pobiera historię Funding Rate z giełdy BitMEX w oparciu o silnik Pandas"""
         print("-> Pobieranie historii Funding Rate z BitMEX...")
         all_funding_dfs = []
@@ -168,52 +184,203 @@ class BitcoinDataIntegrator:
         daily_funding = df.groupby('date')['fundingRate'].last().to_frame()
         return daily_funding
 
-    def get_binance_funding(self, start_date, end_date):
-        """Pobiera historię Funding Rate z Binance"""
-        print("-> Pobieranie historii Funding Rate z Binance...")
-        all_funding = []
+
+    def get_bybit_data(self, start_date, end_date):
+        """
+        Pobiera historię Open Interest oraz Long/Short Ratio
+        dla BTC z giełdy Bybit przy użyciu API v5.
+        Zwraca połączoną dzienną serię danych (stan na koniec dnia).
+        """
+        print("-> Pobieranie wskaźników rynkowych z Bybit v5...")
 
         start_ts = int(datetime.strptime(start_date, '%Y-%m-%d').timestamp() * 1000)
         end_ts = int(datetime.strptime(end_date, '%Y-%m-%d').timestamp() * 1000)
 
+        # --- 1. POBIERANIE OPEN INTEREST ---
+        print("   [1/2] Pobieranie Open Interest...")
+        all_oi_data = []
+        url_oi = "https://api.bybit.com/v5/market/open-interest"
+        params_oi = {
+            'category': 'linear', 'symbol': 'BTCUSDT',
+            'intervalTime': '1d', 'limit': 500,
+            'startTime': start_ts, 'endTime': end_ts
+        }
+
         while True:
-            url = "https://fapi.binance.com/fapi/v1/fundingRate"
-            params = {'symbol': 'BTCUSDT', 'limit': 1000, 'startTime': start_ts}
-            response = requests.get(url, params=params).json()
+            try:
+                res = requests.get(url_oi, params=params_oi, timeout=15)
+                if res.status_code == 429: time.sleep(5); continue
+                data = res.json()
+                if data.get('retCode') != 0: break
 
-            if not response or len(response) == 0:
+                items = data.get('result', {}).get('list', [])
+                if not items: break
+                all_oi_data.extend(items)
+
+                cursor = data.get('result', {}).get('nextPageCursor')
+                if not cursor: break
+                params_oi['cursor'] = cursor
+                time.sleep(0.2)
+            except Exception:
                 break
 
-            filtered_data = [d for d in response if d['fundingTime'] <= end_ts]
-            all_funding.extend(filtered_data)
+        df_oi = pd.DataFrame(all_oi_data)
+        if not df_oi.empty:
+            df_oi['date'] = pd.to_datetime(df_oi['timestamp'].astype(float), unit='ms').dt.normalize()
+            df_oi['Bybit_Open_Interest'] = df_oi['openInterest'].astype(float)
+            df_oi = df_oi.groupby('date')['Bybit_Open_Interest'].last().to_frame()
+        else:
+            df_oi = pd.DataFrame(columns=['Bybit_Open_Interest'])
 
-            last_ts = response[-1]['fundingTime']
-            if last_ts <= start_ts or last_ts >= end_ts:
+
+
+        # --- 2. POBIERANIE LONG/SHORT RATIO ---
+        print("   [2/2] Pobieranie Long/Short Ratio...")
+        all_ratio = []
+        url_ratio = "https://api.bybit.com/v5/market/account-ratio"
+        params_ratio = {
+            'category': 'linear', 'symbol': 'BTCUSDT',
+            'period': '1d', 'limit': 500,
+            'startTime': start_ts, 'endTime': end_ts
+        }
+
+        while True:
+            try:
+                res = requests.get(url_ratio, params=params_ratio, timeout=15)
+                if res.status_code == 429: time.sleep(5); continue
+                data = res.json()
+
+                items = data.get('result', {}).get('list', [])
+                if not items: break
+                all_ratio.extend(items)
+
+                cursor = data.get('result', {}).get('nextPageCursor')
+                if not cursor: break
+                params_ratio['cursor'] = cursor
+                time.sleep(0.2)
+            except Exception:
                 break
 
-            start_ts = last_ts + 1
-            time.sleep(0.2)
+        df_ratio = pd.DataFrame(all_ratio)
+        if not df_ratio.empty:
+            df_ratio['date'] = pd.to_datetime(df_ratio['timestamp'].astype(float), unit='ms').dt.normalize()
+            df_ratio['Bybit_Long_Short_Ratio'] = (
+                        df_ratio['buyRatio'].astype(float) / df_ratio['sellRatio'].astype(float))
+            df_ratio = df_ratio.groupby('date')['Bybit_Long_Short_Ratio'].last().to_frame()
+        else:
+            df_ratio = pd.DataFrame(columns=['Bybit_Long_Short_Ratio'])
 
-        funding_df = pd.DataFrame(all_funding)
-        funding_df['date'] = pd.to_datetime(funding_df['fundingTime'], unit='ms').dt.normalize()
-        funding_df['fundingRate'] = funding_df['fundingRate'].astype(float)
+        # --- ŁĄCZENIE DANYCH (MERGE) ---
+        print("   [+] Łączenie i czyszczenie danych...")
+        dfs = [df_oi, df_ratio]
+        merged_df = pd.concat(dfs, axis=1, join='outer').sort_index()
 
-        daily_funding = funding_df.groupby('date')['fundingRate'].last().to_frame()
-        return daily_funding
+        # Odfiltrowanie do ścisłego przedziału dat
+        merged_df = merged_df[(merged_df.index >= start_date) & (merged_df.index <= end_date)]
 
-    def get_combined_funding(self):
-        """Łączy dane z BitMEX (starsze) oraz Binance (nowsze) w jedną spójną serię"""
-        print("\n-> Integracja finansowania na rynku derywatów (BitMEX + Binance)...")
+        print("-> Zakończono! Zwracam połączony DataFrame wskaźników.")
+        return merged_df
 
-        bitmex_df = self.get_bitmex_funding(FETCH_START_DATE, '2019-09-10')
-        binance_df = self.get_binance_funding('2019-09-10', END_DATE)
+    def get_defillama_data(self):
+        """
+        Pobiera kompleksowe dane o płynności, ryzyku i przepływach kapitału z API DefiLlama:
+        1. Podaż Stablecoinów (Stablecoin_Total_MCap)
+        2. Total Value Locked (DeFi_Global_TVL)
+        3. Wolumen na giełdach DEX (DEX_Daily_Volume)
+        4. Dzienne opłaty sieciowe (DeFi_Global_Daily_Fees)
+        5. Straty z ataków hakerskich (DeFi_Daily_Hacks_Loss_USD)
+        """
+        print("-> Pobieranie maksymalnego zestawu danych (7 wskaźników) z DefiLlama...")
+        dfs = []
 
-        combined_df = pd.concat([bitmex_df, binance_df])
-        combined_df.columns = ['Funding_Rate_Last']
+        # 1. Całkowita kapitalizacja Stablecoinów
+        try:
+            res = requests.get("https://stablecoins.llama.fi/stablecoincharts/all", timeout=15)
+            if res.status_code == 200:
+                parsed = [{'date': pd.to_datetime(int(i['date']), unit='s').normalize(),
+                           'Stablecoin_Total_MCap': float(i.get('totalCirculating', {}).get('peggedUSD', 0))}
+                          for i in res.json() if i.get('totalCirculating', {}).get('peggedUSD')]
+                dfs.append(pd.DataFrame(parsed).set_index('date'))
+        except Exception as e:
+            print(f"   [!] Błąd API Stablecoinów: {e}")
 
-        combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-        return combined_df
+        # 2. Global DeFi TVL
+        try:
+            res = requests.get("https://api.llama.fi/charts", timeout=15)
+            if res.status_code == 200:
+                parsed = [{'date': pd.to_datetime(int(i['date']), unit='s').normalize(),
+                           'DeFi_Global_TVL': float(i['totalLiquidityUSD'])}
+                          for i in res.json()]
+                dfs.append(pd.DataFrame(parsed).set_index('date'))
+        except Exception as e:
+            print(f"   [!] Błąd API TVL: {e}")
 
+        # 3. Global DEX Volume
+        try:
+            res = requests.get("https://api.llama.fi/overview/dexs?excludeTotalDataChart=false&dataType=dailyVolume",
+                               timeout=15)
+            if res.status_code == 200:
+                parsed = [{'date': pd.to_datetime(int(i[0]), unit='s').normalize(),
+                           'DEX_Daily_Volume': float(i[1])}
+                          for i in res.json().get('totalDataChart', [])]
+                dfs.append(pd.DataFrame(parsed).set_index('date'))
+        except Exception as e:
+            print(f"   [!] Błąd API DEX Volume: {e}")
+
+        # 4. Globalne opłaty (Daily Fees)
+        try:
+            res = requests.get("https://api.llama.fi/overview/fees?excludeTotalDataChart=false&dataType=dailyFees",
+                               timeout=15)
+            if res.status_code == 200:
+                parsed = [{'date': pd.to_datetime(int(i[0]), unit='s').normalize(),
+                           'DeFi_Global_Daily_Fees': float(i[1])}
+                          for i in res.json().get('totalDataChart', [])]
+                dfs.append(pd.DataFrame(parsed).set_index('date'))
+        except Exception as e:
+            print(f"   [!] Błąd API Daily Fees: {e}")
+
+        # 5. Ataki hakerskie i exploity (Hacks)
+        try:
+            res = requests.get("https://api.llama.fi/hacks", timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                hacks_list = data.get('hacks', data) if isinstance(data, dict) else data
+                parsed = []
+                for h in hacks_list:
+                    ts = h.get('date')
+                    raw_amount = h.get('amount') if h.get('amount') is not None else h.get('amountLost', 0)
+                    try:
+                        amount = float(raw_amount)
+                    except:
+                        amount = 0.0
+                    if ts:
+                        try:
+                            date_val = pd.to_datetime(int(ts), unit='s').normalize()
+                        except:
+                            date_val = pd.to_datetime(ts).normalize()
+                        parsed.append({'date': date_val, 'DeFi_Daily_Hacks_Loss_USD': amount})
+                if parsed:
+                    df_hacks = pd.DataFrame(parsed).groupby('date')['DeFi_Daily_Hacks_Loss_USD'].sum().to_frame()
+                    dfs.append(df_hacks)
+        except Exception as e:
+            print(f"   [!] Błąd API Hacks: {e}")
+
+
+        if not dfs:
+            print("   [!] Nie udało się pobrać żadnych danych z DefiLlama.")
+            return pd.DataFrame()
+
+        # Łączenie wszystkich wskaźników z DefiLlama w jedną tabelę
+        df_final = dfs[0].join(dfs[1:], how='outer')
+        df_final.sort_index(inplace=True)
+        df_final = df_final[~df_final.index.duplicated(keep='last')]
+
+        # KLUCZOWE ZABEZPIECZENIE (Brak ataków / Brak ogłoszeń VC = 0 USD)
+        for col in ['DeFi_Daily_Hacks_Loss_USD', 'DeFi_Daily_VC_Raises_USD']:
+            if col in df_final.columns:
+                df_final[col] = df_final[col].fillna(0)
+
+        return df_final
 
     def get_blockchaininfo_data(self):
         """Pobiera historyczne, surowe dane On-chain z Blockchain.info API"""
@@ -297,7 +464,7 @@ class BitcoinDataIntegrator:
         params = {
             'assets': 'btc',
             # DODANO: IssTotUSD (Surowa wartość nowej emisji BTC w USD)
-            'metrics': 'BlkCnt,TxCnt,AdrActCnt,IssTotUSD',
+            'metrics': 'BlkCnt, IssTotUSD',
             'frequency': '1d',
             'start_time': f"{FETCH_START_DATE}T00:00:00Z",
             'end_time': f"{END_DATE}T00:00:00Z",
@@ -358,10 +525,12 @@ class BitcoinDataIntegrator:
         """Uruchamia funkcje, łączy tabele i przygotowuje dane pod inżynierię cech"""
         print("\nROZPOCZYNAM INTEGRACJĘ DANYCH...")
 
-        market = self.get_market_data()
+        market = self.get_yahoo_data()
         macro = self.get_macro_data()
         fng = self.get_fear_greed()
-        funding = self.get_combined_funding()
+        funding = self.get_bitmex_data(FETCH_START_DATE, END_DATE)
+        bybit = self.get_bybit_data(FETCH_START_DATE, END_DATE)
+        stable = self.get_defillama_data()
         onchain = self.get_blockchaininfo_data()
         trends = self.get_google_trends()
         blocks = self.get_coinmetrics_data()
@@ -373,6 +542,8 @@ class BitcoinDataIntegrator:
             trends,
             fng,
             funding,
+            bybit,
+            stable,
             onchain,
             blocks
             ]
