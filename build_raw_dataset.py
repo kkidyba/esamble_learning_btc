@@ -4,6 +4,8 @@ from fredapi import Fred
 import requests
 from datetime import datetime, timedelta
 import time
+import random  # Dodane do losowych opóźnień
+from pytrends.request import TrendReq
 
 # ==========================================
 # KONFIGURACJA GŁÓWNA
@@ -22,8 +24,8 @@ class BitcoinDataIntegrator:
     def get_yahoo_data(self):
         print("-> Pobieranie danych z Yahoo Finance (w tym OHLC dla BTC oraz ceny Złota i Ropy WTI)...")
         tickers = ['BTC-USD', '^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F', '^VIX', '^TNX']
-
-        data = yf.download(tickers, start=FETCH_START_DATE, end=END_DATE)
+        yf_end_date = datetime.now().strftime('%Y-%m-%d')
+        data = yf.download(tickers, start=FETCH_START_DATE, end=yf_end_date)
 
         macro_df = data['Close'][['^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F', '^VIX', '^TNX']].rename(columns={
             '^IXIC': 'NASDAQ_100',
@@ -39,7 +41,6 @@ class BitcoinDataIntegrator:
             'BTC_High': data['High']['BTC-USD'],
             'BTC_Low': data['Low']['BTC-USD'],
             'BTC_Close': data['Close']['BTC-USD'],
-            'BTC_Volume': data['Volume']['BTC-USD']
         })
 
         market_df = pd.concat([btc_ohlcv, macro_df], axis=1)
@@ -71,9 +72,9 @@ class BitcoinDataIntegrator:
         try:
             dff_series = self.fred.get_series('DFF', observation_start=FETCH_START_DATE)
             dff_df = dff_series.to_frame(name='DFF_Rate')
-            # POPRAWKA: Przesunięcie daty publikacji o 1 dzień w przód (brak look-ahead bias)
-            dff_df.index = pd.to_datetime(dff_df.index) + pd.Timedelta(days=1)
+            dff_df.index = pd.to_datetime(dff_df.index) + pd.tseries.offsets.BDay(1)
             dff_df.index = dff_df.index.normalize()
+            dff_df = dff_df[~dff_df.index.duplicated(keep='last')]
             macro_dfs.append(dff_df)
         except Exception as e:
             print(f"   [!] Błąd pobierania DFF: {e}")
@@ -106,32 +107,103 @@ class BitcoinDataIntegrator:
             print(f"[!] Błąd pobierania Fear & Greed: {e}")
             return pd.DataFrame()
 
+
+
     def get_google_trends(self):
-        print("-> Pobieranie danych z Google Trends (Sentyment wyszukiwań)...")
-        from pytrends.request import TrendReq
+        print("-> Pobieranie danych z Google Trends (własne okienkowanie i skalowanie)...")
 
         try:
             pytrends = TrendReq(hl='en-US', tz=0)
             kw_list = ["Bitcoin"]
-            timeframe = f"{FETCH_START_DATE} {END_DATE}"
-            pytrends.build_payload(kw_list, cat=0, timeframe=timeframe, geo='', gprop='')
 
-            trends_df = pytrends.interest_over_time()
+            start_dt = pd.to_datetime(FETCH_START_DATE)
+            end_dt = pd.to_datetime(END_DATE)
 
-            if trends_df.empty:
+            window_days = 200
+            overlap_days = 30
+            step_days = window_days - overlap_days
+
+            current_start = start_dt
+            all_trends = []
+
+            while current_start < end_dt:
+                current_end = current_start + pd.Timedelta(days=window_days)
+                if current_end > end_dt:
+                    current_end = end_dt
+
+                timeframe = f"{current_start.strftime('%Y-%m-%d')} {current_end.strftime('%Y-%m-%d')}"
+                print(f"   Pobieranie okna: {timeframe}...")
+
+                max_retries = 4
+                df_window = pd.DataFrame()
+
+                for attempt in range(max_retries):
+                    try:
+                        pytrends.build_payload(kw_list, cat=0, timeframe=timeframe, geo='', gprop='')
+                        df_window = pytrends.interest_over_time()
+                        break
+
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "429" in error_msg:
+                            wait_time = (attempt + 1) * 15 + random.uniform(3.0, 7.0)
+                            print(
+                                f"      [Próba {attempt + 1}/{max_retries} nieudana]: Limit zapytań (429). Czekam {wait_time}s...")
+                            time.sleep(wait_time)
+                        else:
+                            print(f"      [Próba {attempt + 1}/{max_retries} nieudana]: {error_msg}")
+                            time.sleep(10)
+
+                if not df_window.empty:
+                    if 'isPartial' in df_window.columns:
+                        df_window = df_window.drop(columns=['isPartial'])
+                    df_window.columns = ['Google_Trends_BTC']
+                    all_trends.append(df_window)
+                else:
+                    print(f"   [!] Ostrzeżenie: Puste dane dla okna {timeframe}.")
+
+                if current_end == end_dt:
+                    break
+
+                current_start = current_start + pd.Timedelta(days=step_days)
+
+                time.sleep(random.uniform(3.0, 7.0))
+
+            if not all_trends:
+                print("[!] Nie udało się pobrać żadnych danych z Google Trends.")
                 return pd.DataFrame()
 
-            if 'isPartial' in trends_df.columns:
-                trends_df = trends_df.drop(columns=['isPartial'])
+            print("   Łączenie i matematyczne skalowanie okien...")
+            final_df = all_trends[0].copy()
 
-            trends_df.columns = ['Google_Trends_BTC']
-            daily_trends = trends_df.resample('D').ffill()
+            for i in range(1, len(all_trends)):
+                prev_df = final_df
+                curr_df = all_trends[i].copy()
+
+                overlap_index = prev_df.index.intersection(curr_df.index)
+
+                if not overlap_index.empty:
+                    prev_mean = prev_df.loc[overlap_index, 'Google_Trends_BTC'].mean()
+                    curr_mean = curr_df.loc[overlap_index, 'Google_Trends_BTC'].mean()
+
+                    if curr_mean > 0:
+                        scaling_factor = prev_mean / curr_mean
+                        curr_df['Google_Trends_BTC'] = curr_df['Google_Trends_BTC'] * scaling_factor
+
+                new_days = curr_df[~curr_df.index.isin(final_df.index)]
+                final_df = pd.concat([final_df, new_days])
+
+            max_val = final_df['Google_Trends_BTC'].max()
+            if max_val > 0:
+                final_df['Google_Trends_BTC'] = (final_df['Google_Trends_BTC'] / max_val) * 100
+
+            daily_trends = final_df.resample('D').ffill()
             daily_trends.index = pd.to_datetime(daily_trends.index).tz_localize(None).normalize()
 
             return daily_trends
 
         except Exception as e:
-            print(f"[!] Błąd API Google Trends: {e}")
+            print(f"[!] Błąd przetwarzania Google Trends: {e}")
             return pd.DataFrame()
 
     def get_bitmex_data(self, start_date, end_date):
@@ -153,7 +225,7 @@ class BitcoinDataIntegrator:
                 response = requests.get(url, params=params, timeout=15)
 
                 if response.status_code == 429:
-                    time.sleep(5)
+                    time.sleep(30)
                     continue
                 elif response.status_code != 200:
                     break
@@ -213,7 +285,8 @@ class BitcoinDataIntegrator:
         while True:
             try:
                 res = requests.get(url_oi, params=params_oi, timeout=15)
-                if res.status_code == 429: time.sleep(5); continue
+                # POPRAWKA 3: Wydłużenie czasu uśpienia z 5 do 30 sekund w celu ominięcia sztywnych banów
+                if res.status_code == 429: time.sleep(30); continue
                 data = res.json()
                 if data.get('retCode') != 0: break
 
@@ -247,7 +320,7 @@ class BitcoinDataIntegrator:
         while True:
             try:
                 res = requests.get(url_ratio, params=params_ratio, timeout=15)
-                if res.status_code == 429: time.sleep(5); continue
+                if res.status_code == 429: time.sleep(30); continue
                 data = res.json()
 
                 items = data.get('result', {}).get('list', [])
@@ -371,15 +444,15 @@ class BitcoinDataIntegrator:
         print("-> Pobieranie surowych danych On-Chain...")
 
         charts = {
+            'trade-volume': 'Exchange_Trade_Volume_USD',
             'hash-rate': 'Hashrate', 'difficulty': 'Difficulty', 'miners-revenue': 'Miners_Revenue_USD',
             'mempool-size': 'Mempool_Size_Bytes', 'mempool-count': 'Mempool_Tx_Count',
             'median-confirmation-time': 'Median_Conf_Time',
-            'n-transactions': 'Tx_Count', 'n-transactions-excluding-popular': 'Tx_Retail_Count',
+            'n-transactions': 'Tx_Count',
             'n-transactions-per-block': 'Avg_Tx_Per_Block', 'estimated-transaction-volume': 'Est_Tx_Volume_BTC',
             'avg-block-size': 'Avg_Block_Size_MB', 'transaction-fees': 'Total_Fees_BTC',
             'cost-per-transaction-percent': 'Cost_Per_Tx_Percent', 'n-unique-addresses': 'Unique_Addresses',
             'utxo-count': 'UTXO_Count', 'total-bitcoins': 'Circulating_Supply',
-            'trade-volume': 'Exchange_Trade_Volume_USD',
         }
 
         onchain_df = pd.DataFrame()
@@ -464,26 +537,32 @@ class BitcoinDataIntegrator:
         print("\nROZPOCZYNAM INTEGRACJĘ DANYCH...")
 
         market = self.get_yahoo_data()
+
         macro = self.get_macro_data()
-        fng = self.get_fear_greed()
+
         bitmex = self.get_bitmex_data(FETCH_START_DATE, END_DATE)
         bybit = self.get_bybit_data(FETCH_START_DATE, END_DATE)
-        defillama = self.get_defillama_data()
-        blockchaininfo = self.get_blockchaininfo_data()
-        trends = self.get_google_trends()
+
         coinmetrics = self.get_coinmetrics_data()
+        blockchaininfo = self.get_blockchaininfo_data()
+
+        defillama = self.get_defillama_data()
+
+        trends = self.get_google_trends()
+        fng = self.get_fear_greed()
+
 
         print("\n-> Łączenie zbiorów danych (Merging)...")
         dfs = [
             market,
+            blockchaininfo,
+            coinmetrics,
             macro,
-            trends,
-            fng,
             bitmex,
             bybit,
             defillama,
-            blockchaininfo,
-            coinmetrics
+            trends,
+            fng
             ]
         dfs_valid = [df for df in dfs if not df.empty]
 
@@ -493,19 +572,37 @@ class BitcoinDataIntegrator:
 
         self.df_main = dfs_valid[0].join(dfs_valid[1:], how='outer')
 
+        # POPRAWKA 2: Wyłączenie zdarzeń punktowych oraz strumieni wolumenowych z FFill (wypełnienie zerami przed propagacją danych ciągłych)
+        print("-> Wypełnianie braków dla zdarzeń punktowych i wolumenów...")
+        event_cols = ['DeFi_Daily_Hacks_Loss_USD', 'DEX_Daily_Volume', 'DeFi_Global_Daily_Fees']
+
+        # Bezpieczne wypełnianie słownikiem na poziomie całego DataFrame (unika ChainedAssignmentError)
+        fill_events_dict = {col: 0 for col in event_cols if col in self.df_main.columns}
+        self.df_main.fillna(value=fill_events_dict, inplace=True)
+
         print("-> Rozwiązywanie problemu brakujących danych w weekendy (Forward Fill)...")
         self.df_main.ffill(inplace=True)
 
-        print("-> Imputacja danych historycznych (wypełnianie początkowych NaN zerami)...")
+        print("-> Imputacja danych historycznych (inteligentne usuwanie NaN dla początkowych lat)...")
+
+        # 1. Wskaźniki Sentymentu i Proporcji (Brak danych = Całkowita Neutralność)
+        # Fear & Greed (Skala 0-100): Brak danych to neutralny rynek (50), a nie absolutna panika (0)
+        if 'Fear_Greed_Index' in self.df_main.columns:
+            self.df_main['Fear_Greed_Index'] = self.df_main['Fear_Greed_Index'].fillna(50)
+
+        # Long/Short Ratio: Brak danych to idealna równowaga (1.0), a nie 100% pozycji krótkich (0.0)
+        if 'Bybit_Long_Short_Ratio' in self.df_main.columns:
+            self.df_main['Bybit_Long_Short_Ratio'] = self.df_main['Bybit_Long_Short_Ratio'].fillna(1.0)
+
+        # 2. Wskaźniki Wolumetryczne/Pieniężne (Brak danych = Rynek nie istniał = Wartość równa 0)
         cols_to_zero_fill = [
-            'Bybit_Open_Interest', 'Bybit_Long_Short_Ratio',
-            'BitMEX_Funding_Rate_Max', 'BitMEX_Funding_Rate_Min',
-            'Fear_Greed_Index',
-            'Stablecoin_Total_MCap', 'DeFi_Global_TVL', 'DEX_Daily_Volume',
-            'DeFi_Global_Daily_Fees', 'DeFi_Daily_Hacks_Loss_USD', 'Mempool_Size_Bytes', 'Mempool_Tx_Count'
+            'Bybit_Open_Interest',
+            'BitMEX_Funding_Rate_Max', 'BitMEX_Funding_Rate_Min',  # 0 funding = brak dźwigni, czysty spot
+            'Stablecoin_Total_MCap', 'DeFi_Global_TVL',
+            'Mempool_Size_Bytes', 'Mempool_Tx_Count'
         ]
 
-        # POPRAWKA PANDAS: Zastosowanie bezpiecznego słownika w fillna, aby uniknąć ChainedAssignmentError
+        # Wypełniamy bezpiecznie używając słownika
         fill_dict = {col: 0 for col in cols_to_zero_fill if col in self.df_main.columns}
         self.df_main.fillna(value=fill_dict, inplace=True)
 
