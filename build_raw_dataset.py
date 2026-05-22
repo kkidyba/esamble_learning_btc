@@ -485,6 +485,10 @@ class BitcoinDataIntegrator:
 
         return onchain_df
 
+    import time
+    import requests
+    import pandas as pd
+
     def get_coinmetrics_data(self):
         print("-> Pobieranie darmowych metryk on-chain z CoinMetrics...")
 
@@ -494,8 +498,10 @@ class BitcoinDataIntegrator:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
         params = {
-            'assets': 'btc', 'metrics': 'BlkCnt, IssTotUSD', 'frequency': '1d',
-            'start_time': f"{FETCH_START_DATE}T00:00:00Z", 'end_time': f"{END_DATE}T00:00:00Z",
+            'assets': 'btc',
+            'metrics': 'BlkCnt, IssTotUSD',
+            'frequency': '1d',
+            'end_time': f"{END_DATE}T00:00:00Z",
             'page_size': 1000
         }
 
@@ -529,7 +535,16 @@ class BitcoinDataIntegrator:
         df.rename(columns={'BlkCnt': 'Daily_Blocks_Mined', 'IssTotUSD': 'Daily_Issuance_USD'}, inplace=True)
         final_df = df.set_index('date')[['Daily_Blocks_Mined', 'Daily_Issuance_USD']]
         final_df = final_df[~final_df.index.duplicated(keep='last')]
-        final_df.index = pd.to_datetime(final_df.index).tz_localize(None).normalize()
+
+        # Krytyczne przy sumie skumulowanej: upewnienie się, że czas rośnie
+        final_df.sort_index(inplace=True)
+
+        # Obliczanie aktualnej wysokości łańcucha (Total_Blocks)
+        final_df['Total_Blocks'] = final_df['Daily_Blocks_Mined'].cumsum()
+
+        # Oczyszczanie braków i formatowanie bloków jako integer
+        final_df['Daily_Blocks_Mined'] = final_df['Daily_Blocks_Mined'].fillna(0).astype(int)
+        final_df['Total_Blocks'] = final_df['Total_Blocks'].fillna(0).astype(int)
 
         return final_df
 
