@@ -78,7 +78,7 @@ class CryptoFeatureGenerator:
         return atr_series
 
     # ==========================================
-    # Moduły Budujące Cechy
+    # Moduły Budujące Cechy (Kategoria A)
     # ==========================================
     def _build_cat_a_momentum(self):
         close = self.df['BTC_Close']
@@ -146,46 +146,85 @@ class CryptoFeatureGenerator:
         self.df['Price_Percentile_90d'] = close.rolling(window=90).rank(pct=True)
 
     def _build_cat_a_volume(self):
-        """Kategoria A - Podgrupa 6: Wolumen i Przepływy Kapitału"""
         close = self.df['BTC_Close']
         high = self.df['BTC_High']
         low = self.df['BTC_Low']
         volume = self.df['Exchange_Trade_Volume_USD']
 
-        # 21) CMF_28d
         epsilon = 1e-8
         mfm = ((close - low) - (high - close)) / ((high - low) + epsilon)
         mfv = mfm * volume
         self.df['CMF_28d'] = mfv.rolling(window=28).sum() / volume.rolling(window=28).sum()
 
-        # 22) VWAP_Distance_28d
         typical_price = (high + low + close) / 3.0
         typical_price_volume = typical_price * volume
         rolling_vwap_28d = typical_price_volume.rolling(window=28).sum() / volume.rolling(window=28).sum()
         self.df['VWAP_Distance_28d'] = (close / rolling_vwap_28d) - 1.0
 
-        # 23) Volume_Oscillator_7_28
         sma_7_vol = self._sma(volume, window=7)
         sma_28_vol = self._sma(volume, window=28)
         self.df['Volume_Oscillator_7_28'] = (sma_7_vol / sma_28_vol) - 1.0
 
-        # 24) OBV_ZScore_56d
-        # Wyznaczamy kierunek dnia: 1 (wzrost), -1 (spadek), 0 (brak zmiany)
         direction = np.sign(close.diff()).fillna(0)
-
-        # Surowy OBV: skumulowana suma wolumenu z odpowiednim znakiem
         raw_obv = (direction * volume).cumsum()
-
-        # Stacjonaryzacja: wyciągamy 56-dniowy Z-Score
         obv_mean_56d = raw_obv.rolling(window=56).mean()
         obv_std_56d = raw_obv.rolling(window=56).std(ddof=0)
-
         self.df['OBV_ZScore_56d'] = (raw_obv - obv_mean_56d) / obv_std_56d
+
+    # ==========================================
+    # Moduły Budujące Cechy (Kategoria B)
+    # ==========================================
+    def _build_cat_b_macro_flows(self):
+        ndx = self.df['NASDAQ_100']
+        dxy = self.df['DXY_Index']
+        gold = self.df['Gold_Close']
+
+        self.df['NDX_LogRet_28d'] = self._log_return(ndx, window=28)
+        self.df['DXY_LogRet_28d'] = self._log_return(dxy, window=28)
+        self.df['Gold_LogRet_56d'] = self._log_return(gold, window=56)
+
+    def _build_cat_b_intermarket(self):
+        close_btc = self.df['BTC_Close']
+        ndx = self.df['NASDAQ_100']
+        dxy = self.df['DXY_Index']
+
+        log_ret_btc_1d = self._log_return(close_btc, window=1)
+        log_ret_ndx_1d = self._log_return(ndx, window=1)
+        log_ret_dxy_1d = self._log_return(dxy, window=1)
+
+        self.df['Corr_BTC_NDX_56d'] = log_ret_btc_1d.rolling(window=56).corr(log_ret_ndx_1d)
+        self.df['Corr_BTC_DXY_56d'] = log_ret_btc_1d.rolling(window=56).corr(log_ret_dxy_1d)
+
+    def _build_cat_b_liquidity(self):
+        tnx = self.df['TNX']
+        dff = self.df['DFF_Rate']
+        m2 = self.df['M2_Supply']
+
+        self.df['Yield_Curve_Spread'] = tnx - dff
+        self.df['TNX_Diff_28d'] = tnx - tnx.shift(28)
+        self.df['M2_Growth_90d'] = (m2 / m2.shift(90)) - 1.0
+
+    def _build_cat_b_inflation(self):
+        """Kategoria B - Sub-domena 4: Szoki Inflacyjne i Zmienność Systemowa"""
+        core_cpi = self.df['Core_CPI']
+        tnx = self.df['TNX']
+        vix = self.df['VIX_Index']
+
+        # 33) CPI_Growth_YoY
+        self.df['CPI_Growth_YoY'] = (core_cpi / core_cpi.shift(365)) - 1.0
+
+        # 34) Real_Rates_Proxy
+        self.df['Real_Rates_Proxy'] = tnx - (self.df['CPI_Growth_YoY'] * 100.0)
+
+        # 35) VIX_Relative_28d - Detektor "strachu i kapitulacji"
+        sma_28_vix = self._sma(vix, window=28)
+        self.df['VIX_Relative_28d'] = (vix / sma_28_vix) - 1.0
 
     # ==========================================
     # Kompilator Głównego Zbioru
     # ==========================================
-    def generate_dataset(self, output_filename: str = "btc_ml_features_step15.csv"):
+    def generate_dataset(self, output_filename: str = "btc_ml_features_step21.csv"):
+        # Kategoria A
         self._build_cat_a_momentum()
         self._build_cat_a_mean_reversion()
         self._build_cat_a_oscillators()
@@ -193,19 +232,26 @@ class CryptoFeatureGenerator:
         self._build_cat_a_macro_structure()
         self._build_cat_a_volume()
 
+        # Kategoria B
+        self._build_cat_b_macro_flows()
+        self._build_cat_b_intermarket()
+        self._build_cat_b_liquidity()
+        self._build_cat_b_inflation()
+
         features = [
-            # Podgrupa 1
+            # ==== KATEGORIA A ====
             'LogRet_7d', 'LogRet_14d', 'LogRet_28d', 'LogRet_56d', 'LogRet_112d',
-            # Podgrupa 2
             'Dist_SMA_50', 'Dist_SMA_200', 'Dist_EMA_100', 'Cross_SMA50_SMA200',
-            # Podgrupa 3
             'RSI_14', 'RSI_56', 'PPO_Hist_12_26', 'Position_in_Range_56d',
-            # Podgrupa 4
             'Volatility_LogRet_28d', 'NATR_14', 'BB_Width_20', 'Max_Spread_14d', 'Body_Size_Ratio',
-            # Podgrupa 5
             'Historical_Drawdown_365d', 'ATH_Distance_Log', 'Price_Percentile_90d',
-            # Podgrupa 6
-            'CMF_28d', 'VWAP_Distance_28d', 'Volume_Oscillator_7_28', 'OBV_ZScore_56d'
+            'CMF_28d', 'VWAP_Distance_28d', 'Volume_Oscillator_7_28', 'OBV_ZScore_56d',
+
+            # ==== KATEGORIA B ====
+            'NDX_LogRet_28d', 'DXY_LogRet_28d', 'Gold_LogRet_56d',
+            'Corr_BTC_NDX_56d', 'Corr_BTC_DXY_56d',
+            'Yield_Curve_Spread', 'TNX_Diff_28d', 'M2_Growth_90d',
+            'CPI_Growth_YoY', 'Real_Rates_Proxy', 'VIX_Relative_28d'
         ]
 
         ml_df = self.df[features].dropna()
@@ -219,7 +265,7 @@ class CryptoFeatureGenerator:
 
 if __name__ == "__main__":
     generator = CryptoFeatureGenerator("btc_raw_data.csv")
-    df_features = generator.generate_dataset("btc_features_step15.csv")
+    df_features = generator.generate_dataset("btc_features_step21.csv")
 
-    print("\nPróbka wygenerowanych cech (ostatnie 5 wierszy - OBV Z-Score):")
-    print(df_features.tail())
+    print("\nPróbka wygenerowanych cech makroekonomicznych (ostatnie 5 wierszy - w tym VIX_Relative):")
+    print(df_features[['Real_Rates_Proxy', 'VIX_Relative_28d']].tail())
