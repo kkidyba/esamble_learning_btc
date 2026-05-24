@@ -164,16 +164,28 @@ class CryptoFeatureGenerator:
         rolling_vwap_28d = typical_price_volume.rolling(window=28).sum() / volume.rolling(window=28).sum()
         self.df['VWAP_Distance_28d'] = (close / rolling_vwap_28d) - 1.0
 
-        # 23) Volume_Oscillator_7_28 (Dynamika Płynności)
-        # Bada dynamikę między tygodniowym a miesięcznym przepływem kapitału
+        # 23) Volume_Oscillator_7_28
         sma_7_vol = self._sma(volume, window=7)
         sma_28_vol = self._sma(volume, window=28)
         self.df['Volume_Oscillator_7_28'] = (sma_7_vol / sma_28_vol) - 1.0
 
+        # 24) OBV_ZScore_56d
+        # Wyznaczamy kierunek dnia: 1 (wzrost), -1 (spadek), 0 (brak zmiany)
+        direction = np.sign(close.diff()).fillna(0)
+
+        # Surowy OBV: skumulowana suma wolumenu z odpowiednim znakiem
+        raw_obv = (direction * volume).cumsum()
+
+        # Stacjonaryzacja: wyciągamy 56-dniowy Z-Score
+        obv_mean_56d = raw_obv.rolling(window=56).mean()
+        obv_std_56d = raw_obv.rolling(window=56).std(ddof=0)
+
+        self.df['OBV_ZScore_56d'] = (raw_obv - obv_mean_56d) / obv_std_56d
+
     # ==========================================
     # Kompilator Głównego Zbioru
     # ==========================================
-    def generate_dataset(self, output_filename: str = "btc_ml_features_step14.csv"):
+    def generate_dataset(self, output_filename: str = "btc_ml_features_step15.csv"):
         self._build_cat_a_momentum()
         self._build_cat_a_mean_reversion()
         self._build_cat_a_oscillators()
@@ -193,7 +205,7 @@ class CryptoFeatureGenerator:
             # Podgrupa 5
             'Historical_Drawdown_365d', 'ATH_Distance_Log', 'Price_Percentile_90d',
             # Podgrupa 6
-            'CMF_28d', 'VWAP_Distance_28d', 'Volume_Oscillator_7_28'
+            'CMF_28d', 'VWAP_Distance_28d', 'Volume_Oscillator_7_28', 'OBV_ZScore_56d'
         ]
 
         ml_df = self.df[features].dropna()
@@ -207,7 +219,7 @@ class CryptoFeatureGenerator:
 
 if __name__ == "__main__":
     generator = CryptoFeatureGenerator("btc_raw_data.csv")
-    df_features = generator.generate_dataset("btc_features_step14.csv")
+    df_features = generator.generate_dataset("btc_features_step15.csv")
 
-    print("\nPróbka wygenerowanych cech (ostatnie 5 wierszy - w tym Volume Oscillator):")
+    print("\nPróbka wygenerowanych cech (ostatnie 5 wierszy - OBV Z-Score):")
     print(df_features.tail())
