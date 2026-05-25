@@ -13,6 +13,7 @@ class CryptoFeatureGenerator:
         self.df.set_index('Date', inplace=True)
         self.df.sort_index(inplace=True)
 
+
         print("Dane załadowane pomyślnie. Kształt wejściowy:", self.df.shape)
 
     # ==========================================
@@ -205,26 +206,83 @@ class CryptoFeatureGenerator:
         self.df['M2_Growth_90d'] = (m2 / m2.shift(90)) - 1.0
 
     def _build_cat_b_inflation(self):
-        """Kategoria B - Sub-domena 4: Szoki Inflacyjne i Zmienność Systemowa"""
         core_cpi = self.df['Core_CPI']
         tnx = self.df['TNX']
         vix = self.df['VIX_Index']
 
-        # 33) CPI_Growth_YoY
         self.df['CPI_Growth_YoY'] = (core_cpi / core_cpi.shift(365)) - 1.0
-
-        # 34) Real_Rates_Proxy
         self.df['Real_Rates_Proxy'] = tnx - (self.df['CPI_Growth_YoY'] * 100.0)
 
-        # 35) VIX_Relative_28d - Detektor "strachu i kapitulacji"
         sma_28_vix = self._sma(vix, window=28)
         self.df['VIX_Relative_28d'] = (vix / sma_28_vix) - 1.0
 
     # ==========================================
+    # Moduły Budujące Cechy (Kategoria C)
+    # ==========================================
+    def _build_cat_c_mining(self):
+        miners_rev = self.df['Miners_Revenue_USD']
+        hashrate = self.df['Hashrate']
+        difficulty = self.df['Difficulty']
+
+        self.df['Puell_Multiple_Proxy'] = miners_rev / self._sma(miners_rev, window=365)
+
+        sma_30_hash = self._sma(hashrate, window=30)
+        sma_60_hash = self._sma(hashrate, window=60)
+        self.df['Hash_Ribbon_Momentum'] = (sma_30_hash / sma_60_hash) - 1.0
+
+        self.df['Difficulty_Growth_28d'] = (difficulty / difficulty.shift(28)) - 1.0
+
+    def _build_cat_c_valuation(self):
+        supply = self.df['Circulating_Supply']
+        tx_vol_btc = self.df['Est_Tx_Volume_BTC']
+        unique_addr = self.df['Unique_Addresses']
+        tx_count = self.df['Tx_Count']
+
+        epsilon = 1e-8
+        raw_nvt = supply / (tx_vol_btc + epsilon)
+        sma_90_nvt = self._sma(raw_nvt, window=90)
+        self.df['NVT_Signal_90d'] = raw_nvt / sma_90_nvt
+
+        sma_7_addr = self._sma(unique_addr, window=7)
+        sma_28_addr = self._sma(unique_addr, window=28)
+        self.df['Network_Adoption_Momentum'] = (sma_7_addr / sma_28_addr) - 1.0
+
+        self.df['Tx_Intensity_Ratio'] = tx_count / (unique_addr + epsilon)
+
+    def _build_cat_c_congestion(self):
+        """Kategoria C - Sub-domena 3: Zatłoczenie i FOMO Ulicy"""
+        fees_btc = self.df['Total_Fees_BTC']
+        mempool_size = self.df['Mempool_Size_Bytes']
+
+        # Total_Fees_USD i Miners_Revenue_USD muszą być załadowane do tego obliczenia
+        fees_usd = fees_btc * self.df['BTC_Close']
+        miners_rev_usd = self.df['Miners_Revenue_USD']
+
+        epsilon = 1e-8
+
+        # 42) Fee_Spike_Indicator
+        sma_56_fees = self._sma(fees_btc, window=56)
+        self.df['Fee_Spike_Indicator'] = (fees_btc / (sma_56_fees + epsilon)) - 1.0
+
+        # 43) Mempool_Congestion_ZScore_28d
+        mempool_mean_28d = mempool_size.rolling(window=28).mean()
+        mempool_std_28d = mempool_size.rolling(window=28).std(ddof=0)
+        self.df['Mempool_Congestion_ZScore_28d'] = (mempool_size - mempool_mean_28d) / mempool_std_28d
+
+        # 44) Fee_to_Reward_Ratio - Twardy wskaźnik przegrzania (odsetek zysków z opłat)
+        self.df['Fee_to_Reward_Ratio'] = fees_usd / (miners_rev_usd + epsilon)
+
+    def _build_cat_c_supply(self):
+        total_blocks = self.df['Total_Blocks']
+        utxo_count = self.df['UTXO_Count']
+
+        self.df['Halving_Cycle_Position'] = (total_blocks % 210000) / 210000.0
+        self.df['UTXO_Distribution_56d'] = (utxo_count / utxo_count.shift(56)) - 1.0
+
+    # ==========================================
     # Kompilator Głównego Zbioru
     # ==========================================
-    def generate_dataset(self, output_filename: str = "btc_ml_features_step21.csv"):
-        # Kategoria A
+    def generate_dataset(self, output_filename: str = "btc_ml_features_step32.csv"):
         self._build_cat_a_momentum()
         self._build_cat_a_mean_reversion()
         self._build_cat_a_oscillators()
@@ -232,11 +290,15 @@ class CryptoFeatureGenerator:
         self._build_cat_a_macro_structure()
         self._build_cat_a_volume()
 
-        # Kategoria B
         self._build_cat_b_macro_flows()
         self._build_cat_b_intermarket()
         self._build_cat_b_liquidity()
         self._build_cat_b_inflation()
+
+        self._build_cat_c_mining()
+        self._build_cat_c_valuation()
+        self._build_cat_c_congestion()
+        self._build_cat_c_supply()
 
         features = [
             # ==== KATEGORIA A ====
@@ -251,7 +313,17 @@ class CryptoFeatureGenerator:
             'NDX_LogRet_28d', 'DXY_LogRet_28d', 'Gold_LogRet_56d',
             'Corr_BTC_NDX_56d', 'Corr_BTC_DXY_56d',
             'Yield_Curve_Spread', 'TNX_Diff_28d', 'M2_Growth_90d',
-            'CPI_Growth_YoY', 'Real_Rates_Proxy', 'VIX_Relative_28d'
+            'CPI_Growth_YoY', 'Real_Rates_Proxy', 'VIX_Relative_28d',
+
+            # ==== KATEGORIA C ====
+            'Puell_Multiple_Proxy', 'Hash_Ribbon_Momentum', 'Difficulty_Growth_28d',
+            'NVT_Signal_90d', 'Network_Adoption_Momentum', 'Tx_Intensity_Ratio',
+
+            # Sub-domena 3
+            'Fee_Spike_Indicator', 'Mempool_Congestion_ZScore_28d', 'Fee_to_Reward_Ratio',
+
+            # Sub-domena 4
+            'Halving_Cycle_Position', 'UTXO_Distribution_56d'
         ]
 
         ml_df = self.df[features].dropna()
@@ -263,9 +335,10 @@ class CryptoFeatureGenerator:
         return ml_df
 
 
+
 if __name__ == "__main__":
     generator = CryptoFeatureGenerator("btc_raw_data.csv")
-    df_features = generator.generate_dataset("btc_features_step21.csv")
+    df_features = generator.generate_dataset("btc_features_step29.csv")
 
-    print("\nPróbka wygenerowanych cech makroekonomicznych (ostatnie 5 wierszy - w tym VIX_Relative):")
-    print(df_features[['Real_Rates_Proxy', 'VIX_Relative_28d']].tail())
+    print("\nPróbka wygenerowanych cech Makro-Struktury Podaży:")
+    print(df_features.tail())
