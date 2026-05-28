@@ -4,23 +4,28 @@ from fredapi import Fred
 import requests
 from datetime import datetime, timedelta
 import time
-import random  # Dodane do losowych opóźnień
+import random
 from pytrends.request import TrendReq
 
 # ==========================================
-# KONFIGURACJA GŁÓWNA
+# Konfiguracja Główna
 # ==========================================
 FRED_API_KEY = 'f3ac7094f956fdb519c4f98c2453e476'
 FETCH_START_DATE = '2014-09-01'
-MODEL_START_DATE = '2014-09-01'  # Start modelu
 END_DATE = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
 
 class BitcoinDataIntegrator:
+    # ==========================================
+    # Inicjalizacja Klasy
+    # ==========================================
     def __init__(self):
         self.fred = Fred(api_key=FRED_API_KEY)
         self.df_main = pd.DataFrame()
 
+    # ==========================================
+    # Pobieranie Danych: Yahoo Finance
+    # ==========================================
     def get_yahoo_data(self):
         print("-> Pobieranie danych z Yahoo Finance (w tym OHLC dla BTC oraz ceny Złota i Ropy WTI)...")
         tickers = ['BTC-USD', '^IXIC', 'DX-Y.NYB', 'GC=F', 'CL=F', '^VIX', '^TNX']
@@ -48,6 +53,9 @@ class BitcoinDataIntegrator:
 
         return market_df
 
+    # ==========================================
+    # Pobieranie Danych: Makroekonomia (FRED)
+    # ==========================================
     def get_macro_data(self):
         print("-> Pobieranie danych makro z FRED (ALFRED + DFF Shift)...")
         macro_dfs = []
@@ -88,6 +96,9 @@ class BitcoinDataIntegrator:
 
         return macro_df
 
+    # ==========================================
+    # Pobieranie Danych: Sentyment (Fear & Greed)
+    # ==========================================
     def get_fear_greed(self):
         print("-> Pobieranie Sentymentu (Fear & Greed Index)...")
 
@@ -107,8 +118,9 @@ class BitcoinDataIntegrator:
             print(f"[!] Błąd pobierania Fear & Greed: {e}")
             return pd.DataFrame()
 
-
-
+    # ==========================================
+    # Pobieranie Danych: Google Trends
+    # ==========================================
     def get_google_trends(self):
         print("-> Pobieranie danych z Google Trends (własne okienkowanie i skalowanie)...")
 
@@ -206,6 +218,9 @@ class BitcoinDataIntegrator:
             print(f"[!] Błąd przetwarzania Google Trends: {e}")
             return pd.DataFrame()
 
+    # ==========================================
+    # Pobieranie Danych: BitMEX Funding Rate
+    # ==========================================
     def get_bitmex_data(self, start_date, end_date):
         print("-> Pobieranie historii Funding Rate z BitMEX...")
         all_funding_dfs = []
@@ -268,6 +283,9 @@ class BitcoinDataIntegrator:
 
         return daily_funding
 
+    # ==========================================
+    # Pobieranie Danych: Bybit Wskaźniki Rynkowe
+    # ==========================================
     def get_bybit_data(self, start_date, end_date):
         print("-> Pobieranie wskaźników rynkowych z Bybit v5...")
 
@@ -285,8 +303,9 @@ class BitcoinDataIntegrator:
         while True:
             try:
                 res = requests.get(url_oi, params=params_oi, timeout=15)
-                # POPRAWKA 3: Wydłużenie czasu uśpienia z 5 do 30 sekund w celu ominięcia sztywnych banów
-                if res.status_code == 429: time.sleep(30); continue
+                if res.status_code == 429:
+                    time.sleep(30)
+                    continue
                 data = res.json()
                 if data.get('retCode') != 0: break
 
@@ -320,7 +339,9 @@ class BitcoinDataIntegrator:
         while True:
             try:
                 res = requests.get(url_ratio, params=params_ratio, timeout=15)
-                if res.status_code == 429: time.sleep(30); continue
+                if res.status_code == 429:
+                    time.sleep(30)
+                    continue
                 data = res.json()
 
                 items = data.get('result', {}).get('list', [])
@@ -350,8 +371,11 @@ class BitcoinDataIntegrator:
 
         return merged_df
 
+    # ==========================================
+    # Pobieranie Danych: DefiLlama
+    # ==========================================
     def get_defillama_data(self):
-        print("-> Pobieranie maksymalnego zestawu danych (5 wskaźników) z DefiLlama...")
+        print("-> Pobieranie danych z DefiLlama...")
 
         expected_columns = [
             'Stablecoin_Total_MCap',
@@ -440,6 +464,9 @@ class BitcoinDataIntegrator:
 
         return df_final
 
+    # ==========================================
+    # Pobieranie Danych: Blockchain.info On-Chain
+    # ==========================================
     def get_blockchaininfo_data(self):
         print("-> Pobieranie surowych danych On-Chain...")
 
@@ -485,10 +512,9 @@ class BitcoinDataIntegrator:
 
         return onchain_df
 
-    import time
-    import requests
-    import pandas as pd
-
+    # ==========================================
+    # Pobieranie Danych: CoinMetrics On-Chain
+    # ==========================================
     def get_coinmetrics_data(self):
         print("-> Pobieranie darmowych metryk on-chain z CoinMetrics...")
 
@@ -536,36 +562,30 @@ class BitcoinDataIntegrator:
         final_df = df.set_index('date')[['Daily_Blocks_Mined', 'Daily_Issuance_USD']]
         final_df = final_df[~final_df.index.duplicated(keep='last')]
 
-        # Krytyczne przy sumie skumulowanej: upewnienie się, że czas rośnie
         final_df.sort_index(inplace=True)
 
-        # Obliczanie aktualnej wysokości łańcucha (Total_Blocks)
         final_df['Total_Blocks'] = final_df['Daily_Blocks_Mined'].cumsum()
 
-        # Oczyszczanie braków i formatowanie bloków jako integer
         final_df['Daily_Blocks_Mined'] = final_df['Daily_Blocks_Mined'].fillna(0).astype(int)
         final_df['Total_Blocks'] = final_df['Total_Blocks'].fillna(0).astype(int)
 
         return final_df
 
+    # ==========================================
+    # Budowa Głównego Zestawienia (Integracja)
+    # ==========================================
     def build_dataset(self):
         print("\nROZPOCZYNAM INTEGRACJĘ DANYCH...")
 
         market = self.get_yahoo_data()
-
         macro = self.get_macro_data()
-
         bitmex = self.get_bitmex_data(FETCH_START_DATE, END_DATE)
         bybit = self.get_bybit_data(FETCH_START_DATE, END_DATE)
-
         coinmetrics = self.get_coinmetrics_data()
         blockchaininfo = self.get_blockchaininfo_data()
-
         defillama = self.get_defillama_data()
-
         trends = self.get_google_trends()
         fng = self.get_fear_greed()
-
 
         print("\n-> Łączenie zbiorów danych (Merging)...")
         dfs = [
@@ -587,11 +607,9 @@ class BitcoinDataIntegrator:
 
         self.df_main = dfs_valid[0].join(dfs_valid[1:], how='outer')
 
-        # POPRAWKA 2: Wyłączenie zdarzeń punktowych oraz strumieni wolumenowych z FFill (wypełnienie zerami przed propagacją danych ciągłych)
         print("-> Wypełnianie braków dla zdarzeń punktowych i wolumenów...")
         event_cols = ['DeFi_Daily_Hacks_Loss_USD', 'DEX_Daily_Volume', 'DeFi_Global_Daily_Fees']
 
-        # Bezpieczne wypełnianie słownikiem na poziomie całego DataFrame (unika ChainedAssignmentError)
         fill_events_dict = {col: 0 for col in event_cols if col in self.df_main.columns}
         self.df_main.fillna(value=fill_events_dict, inplace=True)
 
@@ -600,24 +618,19 @@ class BitcoinDataIntegrator:
 
         print("-> Imputacja danych historycznych (inteligentne usuwanie NaN dla początkowych lat)...")
 
-        # 1. Wskaźniki Sentymentu i Proporcji (Brak danych = Całkowita Neutralność)
-        # Fear & Greed (Skala 0-100): Brak danych to neutralny rynek (50), a nie absolutna panika (0)
         if 'Fear_Greed_Index' in self.df_main.columns:
             self.df_main['Fear_Greed_Index'] = self.df_main['Fear_Greed_Index'].fillna(50)
 
-        # Long/Short Ratio: Brak danych to idealna równowaga (1.0), a nie 100% pozycji krótkich (0.0)
         if 'Bybit_Long_Short_Ratio' in self.df_main.columns:
             self.df_main['Bybit_Long_Short_Ratio'] = self.df_main['Bybit_Long_Short_Ratio'].fillna(1.0)
 
-        # 2. Wskaźniki Wolumetryczne/Pieniężne (Brak danych = Rynek nie istniał = Wartość równa 0)
         cols_to_zero_fill = [
             'Bybit_Open_Interest',
-            'BitMEX_Funding_Rate_Max', 'BitMEX_Funding_Rate_Min',  # 0 funding = brak dźwigni, czysty spot
+            'BitMEX_Funding_Rate_Max', 'BitMEX_Funding_Rate_Min',
             'Stablecoin_Total_MCap', 'DeFi_Global_TVL',
             'Mempool_Size_Bytes', 'Mempool_Tx_Count'
         ]
 
-        # Wypełniamy bezpiecznie używając słownika
         fill_dict = {col: 0 for col in cols_to_zero_fill if col in self.df_main.columns}
         self.df_main.fillna(value=fill_dict, inplace=True)
 
@@ -637,7 +650,7 @@ class BitcoinDataIntegrator:
 
 
 # ==========================================
-# URUCHOMIENIE SKRYPTU
+# Uruchomienie Skryptu
 # ==========================================
 if __name__ == "__main__":
     integrator = BitcoinDataIntegrator()
