@@ -152,7 +152,7 @@ class DCAPortfolioSimulator:
             else:
                 current_equity = usd_balance + btc_balance * (current_val_price - entry_price)
                 if current_equity < 0:
-                    current_equity = 0.0  # Zero kapitału = likwidacja, wykres nie zejdzie poniżej 0
+                    current_equity = 0.0  # Zero kapitału = likwidacja
 
             equity_curve[i] = current_equity
 
@@ -271,19 +271,19 @@ class DCAPortfolioSimulator:
         ax2.tick_params(axis='y', labelcolor='black')
         ax2.set_ylim(bottom=0)
 
-        # --- TŁO: OKRESY POZA RYNKIEM ---
-        out_of_market = btc_balances == 0
+        # --- TŁO: OKRESY W USD LUB SHORT (ZMIENIONE) ---
+        # btc_balances == 0 oznacza brak pozycji (USD), btc_balances < 0 oznacza pozycję Short
+        usd_or_short = btc_balances <= 0
 
         fill_bg = ax1.fill_between(dates, ax1.get_ylim()[0], ax1.get_ylim()[1],
-                                   where=out_of_market, facecolor='red', alpha=0.1,
-                                   label='Poza rynkiem (100% USD)')
+                                   where=usd_or_short, facecolor='red', alpha=0.1,
+                                   label='Pozycja USD / Short')
 
         lines_1, labels_1 = ax1.get_legend_handles_labels()
         lines_2, labels_2 = ax2.get_legend_handles_labels()
 
         ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left', fontsize=10, framealpha=0.9)
 
-        # Dynamiczny tytuł zależny od ustawień dźwigni
         title_suffix = f'(Dźwignia: {self.leverage}x)' if self.leverage > 0 else '(Spot)'
         plt.title(f'Wyniki Symulacji Strategii vs Benchmark Czystego DCA {title_suffix}', fontsize=16, pad=15)
         plt.grid(True, which='major', axis='x', alpha=0.3)

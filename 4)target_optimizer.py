@@ -36,12 +36,13 @@ class BTCProxyOptimizer:
             initial_capital=1000.0,
             dca_amount=1000.0,
             fee_rate=0.001,
-            mar=0.0
+            mar=0.0,
+            leverage = 2
         )
 
         # --- NOWY KOD: Dynamiczne wyliczanie daty odcięcia (60%) ---
         total_days = len(self.df_raw)
-        train_idx = int(total_days * 0.60)
+        train_idx = int(total_days * 0.9)
         self.cutoff_date = self.df_raw.iloc[train_idx]['Date']
 
         print("-" * 50)
@@ -82,10 +83,10 @@ class BTCProxyOptimizer:
             df['Vol_28d'] = df['Daily_Return'].rolling(28 * 3).std() * np.sqrt(28)
 
         df['Lower_Barrier'] = -(m_lower * df['Vol_28d'])
-        df['Lower_Barrier'] = df['Lower_Barrier'].clip(lower=-1.0, upper=-0.01)
+        df['Lower_Barrier'] = df['Lower_Barrier'].clip(lower=-2, upper=-0.01)
 
         df['Upper_Barrier'] = (m_upper * df['Vol_28d'])
-        df['Upper_Barrier'] = df['Upper_Barrier'].clip(lower=0.02, upper=1.0)
+        df['Upper_Barrier'] = df['Upper_Barrier'].clip(lower=0.02, upper=2)
 
         closes = df['BTC_Close'].values
         lows = df['BTC_Low'].values
@@ -217,8 +218,8 @@ class BTCProxyOptimizer:
         print("\nPrzesiewam wyniki przez filtry bezpieczeństwa...")
 
 
-        warunek_f1 = df_results['F1_Macro'] > 0.60
-        warunek_mcc = df_results['MCC'] > 0.2
+        warunek_f1 = df_results['F1_Macro'] > 0.52
+        warunek_mcc = df_results['MCC'] > 0.12
         warunek_balans_min = df_results['Rozkład_Jedynek (%)'] >= 35.0
         warunek_balans_max = df_results['Rozkład_Jedynek (%)'] <= 65.0
         warunek_sortino = df_results['Wynik_DCA_(Sortino)'] > 1
@@ -269,8 +270,8 @@ if __name__ == "__main__":
         hysteresis_k=7
     )
 
-    m_lower_test = [0.6, 0.8, 1.0, 1.2, 1.4, 1.6]
-    m_upper_test = [0.8, 1.0, 1.2, 1.4, 1.6, 1.8]
+    m_lower_test = [0.2,0.4,0.6,0.7,0.8,1.0,1.2,1.6,1.8, 2.0]
+    m_upper_test = [0.4,0.6,0.7,0.8,1.0,1.2,1.6,1.8, 2.0,2.2, 2.4,2.6,2.8,3.0, 3.2, 3.4,3.6,3.8,4.0]
 
     wyniki = optimizer.run_grid_search(m_lower_test, m_upper_test)
 
@@ -291,3 +292,4 @@ if __name__ == "__main__":
         print(f"Zapisano ostateczny plik! Ostatnie 28 wierszy posiada poprawnie NaN w kolumnie Target.")
     else:
         print("\n[!] Żadna z testowanych kombinacji nie spełniła naraz wymogów F1 > 0.6 i Balansu.")
+

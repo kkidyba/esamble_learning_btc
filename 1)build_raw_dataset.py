@@ -11,7 +11,8 @@ from pytrends.request import TrendReq
 # Konfiguracja Główna
 # ==========================================
 FRED_API_KEY = 'f3ac7094f956fdb519c4f98c2453e476'
-FETCH_START_DATE = '2014-09-01'
+FETCH_START_DATE = '2010-12-01'
+MODEL_START_DATE = '2011-01-01'
 END_DATE = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
 
@@ -41,17 +42,95 @@ class BitcoinDataIntegrator:
             '^TNX': 'TNX'
         })
 
-        btc_ohlcv = pd.DataFrame({
-            'BTC_Open': data['Open']['BTC-USD'],
-            'BTC_High': data['High']['BTC-USD'],
-            'BTC_Low': data['Low']['BTC-USD'],
-            'BTC_Close': data['Close']['BTC-USD'],
-        })
+        # btc_ohlcv = pd.DataFrame({
+        #     'BTC_Open': data['Open']['BTC-USD'],
+        #     'BTC_High': data['High']['BTC-USD'],
+        #     'BTC_Low': data['Low']['BTC-USD'],
+        #     'BTC_Close': data['Close']['BTC-USD'],
+        # })
+        #
+        # market_df = pd.concat([macro_df], axis=1)
+        macro_df.index = pd.to_datetime(macro_df.index).tz_localize(None).normalize()
 
-        market_df = pd.concat([btc_ohlcv, macro_df], axis=1)
-        market_df.index = pd.to_datetime(market_df.index).tz_localize(None).normalize()
+        return macro_df
 
-        return market_df
+# ==========================================
+# Pobieranie Danych: CCData (CryptoCompare) dla BTC
+# ==========================================
+    # ==========================================
+    # Pobieranie Danych: CCData (CryptoCompare) dla BTC
+    # ==========================================
+    def get_cryptocompare_btc_data(self):
+        print("-> Pobieranie historycznych danych OHLC dla BTC z CCData (CCCAGG Index)...")
+        url = "https://min-api.cryptocompare.com/data/v2/histoday"
+
+        all_data = []
+        end_ts = int(datetime.strptime(END_DATE, '%Y-%m-%d').timestamp())
+        start_ts = int(datetime.strptime(FETCH_START_DATE, '%Y-%m-%d').timestamp())
+
+        current_to_ts = end_ts
+
+        while current_to_ts > start_ts:
+            params = {
+                'fsym': 'BTC',
+                'tsym': 'USD',
+                'limit': 2000,
+                'toTs': current_to_ts
+            }
+
+            try:
+                response = requests.get(url, params=params, timeout=15)
+                data = response.json()
+
+                if data.get('Response') != 'Success':
+                    print(f"[!] Błąd API CryptoCompare: {data.get('Message')}")
+                    break
+
+                chunk = data['Data']['Data']
+                if not chunk:
+                    break
+
+                all_data.extend(chunk)
+
+                # CryptoCompare zwraca najstarszy wpis jako pierwszy w danej paczce
+                oldest_in_chunk = chunk[0]['time']
+
+                # Zabezpieczenie przed pętlą nieskończoną
+                if oldest_in_chunk >= current_to_ts:
+                    break
+
+                    # Przesuwamy okno czasowe wstecz (minus 1 dzień)
+                current_to_ts = oldest_in_chunk - 86400
+                time.sleep(0.2)
+
+            except Exception as e:
+                print(f"[!] Błąd żądania do CryptoCompare: {e}")
+                break
+
+        if not all_data:
+            print("[!] Nie pobrano danych z CryptoCompare.")
+            return pd.DataFrame()
+
+        # Tworzenie DataFrame i rzutowanie na czyste daty
+        df = pd.DataFrame(all_data)
+        df['date'] = pd.to_datetime(df['time'], unit='s').dt.normalize()
+
+        # Usuwamy duplikaty (na łączeniach okien) i filtrujemy od daty początkowej
+        df = df.drop_duplicates(subset=['date']).sort_values('date')
+        df = df[df['date'] >= pd.to_datetime(FETCH_START_DATE)]
+
+        df.rename(columns={
+            'open': 'BTC_Open',
+            'high': 'BTC_High',
+            'low': 'BTC_Low',
+            'close': 'BTC_Close',
+            'volumeto': 'BTC_Volume_USD'
+        }, inplace=True)
+
+        df.set_index('date', inplace=True)
+
+        # Zwracamy wyłącznie znormalizowane ceny i wolumen w USD
+        return df[['BTC_Open', 'BTC_High', 'BTC_Low', 'BTC_Close', 'BTC_Volume_USD']]
 
     # ==========================================
     # Pobieranie Danych: Makroekonomia (FRED)
@@ -471,7 +550,7 @@ class BitcoinDataIntegrator:
         print("-> Pobieranie surowych danych On-Chain...")
 
         charts = {
-            'trade-volume': 'Exchange_Trade_Volume_USD',
+            # 'trade-volume': 'Exchange_Trade_Volume_USD',
             'hash-rate': 'Hashrate', 'difficulty': 'Difficulty', 'miners-revenue': 'Miners_Revenue_USD',
             'mempool-size': 'Mempool_Size_Bytes', 'mempool-count': 'Mempool_Tx_Count',
             'median-confirmation-time': 'Median_Conf_Time',
@@ -577,6 +656,7 @@ class BitcoinDataIntegrator:
     def build_dataset(self):
         print("\nROZPOCZYNAM INTEGRACJĘ DANYCH...")
 
+        btc_ohlc = self.get_cryptocompare_btc_data()
         market = self.get_yahoo_data()
         macro = self.get_macro_data()
         bitmex = self.get_bitmex_data(FETCH_START_DATE, END_DATE)
@@ -587,8 +667,10 @@ class BitcoinDataIntegrator:
         trends = self.get_google_trends()
         fng = self.get_fear_greed()
 
+
         print("\n-> Łączenie zbiorów danych (Merging)...")
         dfs = [
+            btc_ohlc,
             market,
             blockchaininfo,
             coinmetrics,
@@ -616,7 +698,13 @@ class BitcoinDataIntegrator:
         print("-> Rozwiązywanie problemu brakujących danych w weekendy (Forward Fill)...")
         self.df_main.ffill(inplace=True)
 
+        print(f"-> Przycinanie zbioru danych do docelowego horyzontu: {MODEL_START_DATE} do {END_DATE}")
+        self.df_main = self.df_main[self.df_main.index >= MODEL_START_DATE]
+        self.df_main = self.df_main[self.df_main.index <= END_DATE]
+
+
         print("-> Imputacja danych historycznych (inteligentne usuwanie NaN dla początkowych lat)...")
+
 
         if 'Fear_Greed_Index' in self.df_main.columns:
             self.df_main['Fear_Greed_Index'] = self.df_main['Fear_Greed_Index'].fillna(50)

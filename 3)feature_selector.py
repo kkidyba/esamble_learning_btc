@@ -47,7 +47,7 @@ class FeatureSelector:
         print(f"Ilość cech przed: {self.df.shape[1]}")
         print(f"Ilość cech po:   {df_cleaned.shape[1]}")
         print(f"Plik wyjściowy:  {output_file}")
-
+        print(df_cleaned.head())
         return df_cleaned
 
 
@@ -57,3 +57,4 @@ if __name__ == "__main__":
     print("!!!Double check!!!")
     selector = FeatureSelector("btc_ml_features_cleaned.csv")
     df_clean = selector.remove_highly_correlated_features(threshold=0.85)
+

@@ -209,7 +209,7 @@ class CryptoFeatureGenerator:
         close = self.df['BTC_Close']
         high = self.df['BTC_High']
         low = self.df['BTC_Low']
-        volume = self.df['Exchange_Trade_Volume_USD']
+        volume = self.df['BTC_Volume_USD']
 
         epsilon = 1e-8
         mfm = ((close - low) - (high - close)) / ((high - low) + epsilon)
@@ -412,7 +412,7 @@ class CryptoFeatureGenerator:
         defi_fees = self.df['DeFi_Global_Daily_Fees']
 
         dex_vol = self.df['DEX_Daily_Volume']
-        cex_vol = self.df['Exchange_Trade_Volume_USD']
+        cex_vol = self.df['BTC_Volume_USD']
 
         epsilon = 1e-8
 
@@ -482,10 +482,10 @@ class CryptoFeatureGenerator:
 
         features = [
             # ==== KATEGORIA A (Kalendarz) ====
-            'Day_of_Week',
-            'Day_of_Month',
-            'Month',
-            'Quarter',
+            'Day_of_Week', #1
+            'Day_of_Month', #2
+            'Month',#3
+            'Quarter',#4
 
             # ==== KATEGORIA A (Momentum & Mean Reversion) ====
             'LogRet_7d',
