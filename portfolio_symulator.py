@@ -156,11 +156,12 @@ class DCAPortfolioSimulator:
 
             equity_curve[i] = current_equity
 
-            # 4. Obliczenie prawdziwej stopy zwrotu
+            # 4. Obliczenie prawdziwej stopy zwrotu (ZMODYFIKOWANE)
             if i > 0:
                 prev_equity = equity_curve[i - 1]
                 if prev_equity > 0:
-                    true_returns[i] = (current_equity - dca_today) / prev_equity - 1.0
+                    # Użycie stopy logarytmicznej
+                    true_returns[i] = np.log((current_equity - dca_today) / prev_equity)
                 else:
                     true_returns[i] = 0.0
             else:

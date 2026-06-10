@@ -11,6 +11,7 @@ from pytrends.request import TrendReq
 # Konfiguracja Główna
 # ==========================================
 FRED_API_KEY = 'f3ac7094f956fdb519c4f98c2453e476'
+CCDATA_API_KEY = '23c6099e959e8b974663970bad395a95d15ade135e47953330a69d5f2ba915d0'
 FETCH_START_DATE = '2010-12-01'
 MODEL_START_DATE = '2011-01-01'
 END_DATE = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -40,7 +41,7 @@ class BitcoinDataIntegrator:
             'CL=F': 'WTI_Oil_Close',
             '^VIX': 'VIX_Index',
             '^TNX': 'TNX'
-        })
+            })
 
         # btc_ohlcv = pd.DataFrame({
         #     'BTC_Open': data['Open']['BTC-USD'],
@@ -54,12 +55,11 @@ class BitcoinDataIntegrator:
 
         return macro_df
 
-# ==========================================
-# Pobieranie Danych: CCData (CryptoCompare) dla BTC
-# ==========================================
+
     # ==========================================
     # Pobieranie Danych: CCData (CryptoCompare) dla BTC
     # ==========================================
+
     def get_cryptocompare_btc_data(self):
         print("-> Pobieranie historycznych danych OHLC dla BTC z CCData (CCCAGG Index)...")
         url = "https://min-api.cryptocompare.com/data/v2/histoday"
@@ -70,6 +70,16 @@ class BitcoinDataIntegrator:
 
         current_to_ts = end_ts
 
+        # Dodanie nagłówków, aby obejść blokady (np. Cloudflare)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
+
+        # Jeśli podano klucz API, autoryzuj żądanie
+        if CCDATA_API_KEY:
+            headers["authorization"] = f"Apikey {CCDATA_API_KEY}"
+
         while current_to_ts > start_ts:
             params = {
                 'fsym': 'BTC',
@@ -79,11 +89,27 @@ class BitcoinDataIntegrator:
             }
 
             try:
-                response = requests.get(url, params=params, timeout=15)
-                data = response.json()
+                response = requests.get(url, params=params, headers=headers, timeout=15)
+
+                # Bezpieczne ładowanie JSON, w razie bloku WAF dostaniemy HTML
+                try:
+                    data = response.json()
+                except ValueError:
+                    print(f"[!] Błąd parsowania JSON. Kod statusu: {response.status_code}")
+                    print(f"[!] Surowa odpowiedź: {response.text[:300]}")
+                    break
 
                 if data.get('Response') != 'Success':
-                    print(f"[!] Błąd API CryptoCompare: {data.get('Message')}")
+                    # Pobieramy całą odpowiedź, by zobaczyć faktyczny błąd, jeśli 'Message' nie istnieje
+                    error_msg = data.get('Message', 'Brak zdefiniowanej wiadomości o błędzie')
+                    print(f"[!] Błąd API CryptoCompare: {error_msg}")
+                    print(f"[!] Pełny payload API: {data}")
+                    break
+
+                # Ważne: Sprawdzamy czy struktura danych na pewno istnieje
+                if 'Data' not in data or 'Data' not in data['Data']:
+                    print("[!] Otrzymano nieoczekiwaną strukturę danych API.")
+                    print(f"[!] Podgląd: {data}")
                     break
 
                 chunk = data['Data']['Data']
@@ -92,30 +118,30 @@ class BitcoinDataIntegrator:
 
                 all_data.extend(chunk)
 
-                # CryptoCompare zwraca najstarszy wpis jako pierwszy w danej paczce
                 oldest_in_chunk = chunk[0]['time']
 
-                # Zabezpieczenie przed pętlą nieskończoną
                 if oldest_in_chunk >= current_to_ts:
                     break
 
-                    # Przesuwamy okno czasowe wstecz (minus 1 dzień)
                 current_to_ts = oldest_in_chunk - 86400
-                time.sleep(0.2)
 
+                # Wydłużony sleep dla darmowego API bez klucza (CryptoCompare bywa wrażliwe)
+                time.sleep(0.5)
+
+            except requests.exceptions.RequestException as e:
+                print(f"[!] Błąd połączenia z API CryptoCompare: {e}")
+                break
             except Exception as e:
-                print(f"[!] Błąd żądania do CryptoCompare: {e}")
+                print(f"[!] Nieoczekiwany błąd: {e}")
                 break
 
         if not all_data:
             print("[!] Nie pobrano danych z CryptoCompare.")
             return pd.DataFrame()
 
-        # Tworzenie DataFrame i rzutowanie na czyste daty
         df = pd.DataFrame(all_data)
         df['date'] = pd.to_datetime(df['time'], unit='s').dt.normalize()
 
-        # Usuwamy duplikaty (na łączeniach okien) i filtrujemy od daty początkowej
         df = df.drop_duplicates(subset=['date']).sort_values('date')
         df = df[df['date'] >= pd.to_datetime(FETCH_START_DATE)]
 
@@ -129,7 +155,6 @@ class BitcoinDataIntegrator:
 
         df.set_index('date', inplace=True)
 
-        # Zwracamy wyłącznie znormalizowane ceny i wolumen w USD
         return df[['BTC_Open', 'BTC_High', 'BTC_Low', 'BTC_Close', 'BTC_Volume_USD']]
 
     # ==========================================
