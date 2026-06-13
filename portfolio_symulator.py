@@ -269,6 +269,7 @@ class DCAPortfolioSimulator:
         line_fiat = ax2.plot(dates, fiat_invested_curve, color=color_fiat, label='Skumulowane Wpłaty (Fiat)',
                              linewidth=1.5, drawstyle='steps-post')
 
+        ax2.ticklabel_format(style='plain', axis='y')
         ax2.tick_params(axis='y', labelcolor='black')
         ax2.set_ylim(bottom=0)
 
