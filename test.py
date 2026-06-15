@@ -133,11 +133,19 @@ class WalkForwardSplitter:
             current_start += pd.DateOffset(months=self.test_months)
 
 
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import optuna
+import gc
+from portfolio_symulator import DCAPortfolioSimulator  # Upewnij się, że ten import pozostaje
+
+
 class XGBoostOptunaOptimizer:
     """
-    Optymalizuje model XGBoost pod kątem maksymalizacji wskaźnika Sortino,
-    wykorzystując zewnętrzny symulator portfela na zbiorze walidacyjnym.
-    Zabezpieczone przed wyciekami pamięci (VRAM/RAM).
+    Optymalizuje model XGBoost pod kątem maksymalizacji wskaźnika Sortino.
+    Wersja zoptymalizowana: Optuna w pełni kontroluje hiperparametry (w tym n_estimators),
+    eliminując konflikt z early stopping.
     """
 
     def __init__(self, simulator_params: dict, n_trials: int = 30):
@@ -154,34 +162,30 @@ class XGBoostOptunaOptimizer:
         scale_pos_weight_val = num_zeros / num_ones if num_ones > 0 else 1.0
 
         def objective(trial):
-            # 2. DYNAMICZNY ROZMIAR LIŚCIA
-            min_child_fraction = trial.suggest_float('min_child_fraction', 0.01, 0.05)
-            min_child_weight_val = max(1, int(min_child_fraction * len(X_train)))
 
             params = {
                 'max_depth': trial.suggest_int('max_depth', 2, 5),
-                'min_child_weight': min_child_weight_val,
+                'min_child_weight': trial.suggest_int('min_child_weight', 28, 168),
                 'gamma': trial.suggest_float('gamma', 0.1, 3.0),
                 'subsample': trial.suggest_float('subsample', 0.4, 0.85),
                 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.4, 0.8),
                 'alpha': trial.suggest_float('alpha', 1e-2, 10.0, log=True),
                 'lambda': trial.suggest_float('lambda', 1e-2, 10.0, log=True),
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05, log=True),
-                'n_estimators': 2500,
+                # Optuna teraz bezpośrednio kontroluje liczbę drzew
+                'n_estimators': trial.suggest_int('n_estimators', 50, 2500),
                 'objective': 'binary:logistic',
-                'eval_metric': 'auc',
                 'tree_method': 'hist',
                 'device': 'cuda',
                 'random_state': 42,
-                'scale_pos_weight': scale_pos_weight_val,
-                'early_stopping_rounds': 50
+                'scale_pos_weight': scale_pos_weight_val
             }
 
             model = xgb.XGBClassifier(**params)
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
-            best_iter = getattr(model, 'best_iteration', 2500)
-            trial.set_user_attr("best_iteration", best_iter)
+            # Brak eval_set oraz early_stopping_rounds - model uczy się na 'ślepo'
+            # dokładnie do ustalonej przez Optunę wartości n_estimators
+            model.fit(X_train, y_train, verbose=False)
 
             preds_class = model.predict(X_val)
             simulator = DCAPortfolioSimulator(**self.simulator_params)
@@ -215,30 +219,22 @@ class XGBoostOptunaOptimizer:
                 return -99.0
 
         study = optuna.create_study(direction='maximize')
-        # n_jobs=1 zapobiega błędom "CUDA Out of Memory"
-        study.optimize(objective, n_trials=self.n_trials, n_jobs=1)
+        study.optimize(objective, n_trials=self.n_trials, n_jobs=4)
 
-        best_trial = study.best_trial
-        best_params_raw = best_trial.params
+        best_params_raw = study.best_trial.params
 
-        optimal_trees = best_trial.user_attrs.get("best_iteration", 500)
-        final_n_estimators = int(optimal_trees * 1.1)
-
-        final_train_len = len(X_train) + len(X_val)
-        final_min_child_weight = max(1, int(best_params_raw['min_child_fraction'] * final_train_len))
-
+        # Generowanie finalnych parametrów bez sztucznych mnożników
         final_model_params = {
             'max_depth': best_params_raw['max_depth'],
-            'min_child_weight': final_min_child_weight,
+            'min_child_weight': best_params_raw['min_child_weight'],
             'gamma': best_params_raw['gamma'],
             'subsample': best_params_raw['subsample'],
             'colsample_bytree': best_params_raw['colsample_bytree'],
             'alpha': best_params_raw['alpha'],
             'lambda': best_params_raw['lambda'],
             'learning_rate': best_params_raw['learning_rate'],
-            'n_estimators': final_n_estimators,
+            'n_estimators': best_params_raw['n_estimators'],  # Bezpośrednie przekazanie z Optuny
             'objective': 'binary:logistic',
-            'eval_metric': 'auc',
             'tree_method': 'hist',
             'device': 'cuda',
             'random_state': 42,
@@ -251,19 +247,22 @@ class XGBoostOptunaOptimizer:
 class WalkForwardOrchestrator:
     """
     Zarządza podziałem danych i procesem trenowania/testowania z brutalnym czyszczeniem pamięci po każdym cyklu.
+    Zmiana: Oblicza i zwraca ROI oraz Sortino dla każdego pojedynczego okresu testowego.
     """
 
-    def __init__(self, data_loader, splitter, optimizer, target_column):
+    def __init__(self, data_loader, splitter, optimizer, target_column, sim_params):
         self.data_loader = data_loader
         self.splitter = splitter
         self.optimizer = optimizer
         self.target_column = target_column
+        self.sim_params = sim_params  # Dodano przekazanie parametrów symulatora
 
-    def execute(self) -> pd.DataFrame:
+    def execute(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         print("Trwa ładowanie i wyrównywanie szeregów czasowych...")
         df_master = self.data_loader.load_and_align(self.target_column)
 
         all_out_of_sample_predictions = []
+        step_metrics = []  # Lista do zbierania parametrów, ROI i Sortino z każdego kroku
         cols_to_drop = [self.target_column, 'BTC_Close']
 
         for step, window in enumerate(self.splitter.generate_windows(df_master), 1):
@@ -304,6 +303,39 @@ class WalkForwardOrchestrator:
             preds_proba = final_model.predict_proba(X_test)[:, 1]
             preds_class = final_model.predict(X_test)
 
+            # ==========================================================
+            # NOWE: Ewaluacja na danym oknie testowym (Out-Of-Sample)
+            # ==========================================================
+            test_dates = test_df.index.values
+            test_prices = test_df['BTC_Close'].values
+
+            step_simulator = DCAPortfolioSimulator(**self.sim_params)
+            try:
+                step_results = step_simulator.simulate(
+                    dates=test_dates,
+                    prices=test_prices,
+                    signals=preds_class,
+                    execution_prices=test_prices
+                )
+                step_sortino = step_results.get('Sortino', 0.0)
+                step_roi = step_results.get('ROI', 0.0)
+            except Exception:
+                step_sortino = 0.0
+                step_roi = 0.0
+
+            print(f">>> Wynik kroku {step} (OOS): Sortino = {step_sortino:.2f} | ROI = {step_roi * 100:.2f}%")
+
+            # Zapisujemy parametry i metryki do listy
+            step_metrics.append({
+                'Step': step,
+                'Test_Start': meta['test_range'][0],
+                'Test_End': meta['test_range'][1],
+                'Sortino': step_sortino,
+                'ROI': step_roi,
+                'Model_Params': str(final_model_params)
+            })
+            # ==========================================================
+
             results_df = pd.DataFrame({
                 'Date': test_df.index,
                 'BTC_Close': test_df['BTC_Close'].values,
@@ -321,16 +353,21 @@ class WalkForwardOrchestrator:
             del final_model
             del preds_proba, preds_class, results_df
             del val_dates, val_prices
+            del step_simulator, test_dates, test_prices  # Czyszczenie symulatora kroku
+            if 'step_results' in locals():
+                del step_results
             gc.collect()
             # ------------------------------------------------------
 
         final_results = pd.concat(all_out_of_sample_predictions)
-        return final_results
+        metrics_df = pd.DataFrame(step_metrics)  # Konwersja metryk na DataFrame
+        return final_results, metrics_df
 
 
 def evaluate_xgboost_strategy(predictions_file_path: str, sim_params: dict):
     """
     Funkcja, która wczytuje wygenerowane targety i uruchamia symulację portfela.
+    Wypisuje porównanie strategii ML z Czystym DCA.
     """
     print(f"\nWczytywanie sygnałów z pliku: {predictions_file_path}")
 
@@ -358,14 +395,23 @@ def evaluate_xgboost_strategy(predictions_file_path: str, sim_params: dict):
         execution_prices=prices
     )
 
-    print("\n--- PODSUMOWANIE WYNIKÓW SYMULACJI (Out-of-Sample) ---")
-    print(f"Całkowity zainwestowany kapitał (Fiat): ${results['Total_Invested']:,.2f}")
-    print(f"Wartość końcowa portfela (Strategia ML): ${results['Final_Equity']:,.2f}")
-    print(f"Wartość końcowa portfela (Strategia ML): ${results['Final_Equity']:,.2f}")
-    print(f"ROI Strategii: {results['ROI'] * 100:.2f}%")
-    print(f"Sortino Ratio Strategii: {results['Sortino']:.2f}")
+    print("\n=======================================================")
+    print("      PODSUMOWANIE WYNIKÓW SYMULACJI (Out-of-Sample)     ")
+    print("=======================================================")
+    print(f"Całkowity zainwestowany kapitał (Fiat): ${results['Total_Invested']:,.2f}\n")
 
-    print("\nGenerowanie wykresu analizy portfela...")
+    print("--- STRATEGIA ML XGBoost ---")
+    print(f"Wartość końcowa portfela:               ${results['Final_Equity']:,.2f}")
+    print(f"ROI Strategii:                          {results['ROI'] * 100:.2f}%")
+    print(f"Sortino Ratio Strategii:                {results['Sortino']:.2f}\n")
+
+    print("--- Czyste DCA ---")
+    print(f"Wartość końcowa portfela:               ${results['DCA_Final_Equity']:,.2f}")
+    print(f"ROI Benchmarku:                         {results['DCA_ROI'] * 100:.2f}%")
+    print(f"Sortino Ratio Benchmarku:               {results['DCA_Sortino']:.2f}")
+    print("=======================================================\n")
+
+    print("Generowanie wykresu analizy portfela...")
     simulator.plot_simulation_results(results, execution_prices=prices)
 
 
@@ -386,294 +432,62 @@ if __name__ == "__main__":
         'leverage': 0
     }
 
-    n_trials = 20
-    test_years = 1
     loader = TimeSeriesDataLoader(
         raw_data_path=RAW_DATA_PATH,
         features_path=FEATURES_PATH
     )
-    START_DATE_LEARN = '2012-01-01'
-    train_years = 2
-    while train_years < 8:
-        val_years = 6
 
-        while val_years > 0:
-            if train_years >= val_years and train_years + val_years == 8:
-                # Parametry symulatora, pod które optymalizowany będzie XGBoost oraz podpięty finalny wykres
+    scenarios = [
+        ('2012-01-01', 8),
+        ('2013-01-01', 7),
+        ('2014-01-01', 6),
+        ('2015-01-01', 5),
+        ('2016-01-01', 4),
+        ('2017-01-01', 3)
+    ]
 
-                # Układ okien z Twojego zapytania (6 lat uczenia, 2 lata walidacji, 1 rok testu)
-                splitter = WalkForwardSplitter(
-                    train_years=train_years,
-                    val_years=val_years,
-                    test_years=test_years,
-                    expanding_window=True,
-                    start_date= START_DATE_LEARN
-                )
+    test_years = [1.5, 1, 0.5, 0.25]
 
-                # Optymalizator
-                optimizer = XGBoostOptunaOptimizer(
-                    simulator_params=sim_params,
-                    n_trials=n_trials
-                )
+    n_trials = [100, 250, 500]
 
-                # Orkiestrator
-                orchestrator = WalkForwardOrchestrator(
-                    data_loader=loader,
-                    splitter=splitter,
-                    optimizer=optimizer,
-                    target_column=TARGET_COLUMN_NAME
-                )
+    for start_date, target_sum in scenarios:
+        for train_years in range(2, 8):
+            for t_y in test_years:
+                for n_t in n_trials:
+                    val_years = target_sum - train_years
 
-                # 3. EGZEKUCJA - Faza uczenia i generowania sygnałów
-                out_of_sample_df = orchestrator.execute()
+                    if val_years > 0 and train_years >= val_years:
+                        splitter = WalkForwardSplitter(
+                            train_years=train_years,
+                            val_years=val_years,
+                            test_years=t_y,
+                            expanding_window=True,
+                            start_date=start_date
+                        )
 
-                # Zapis finalnego zbioru sygnałów
-                out_of_sample_df.to_csv(PREDICTIONS_FILE)
+                        optimizer = XGBoostOptunaOptimizer(simulator_params=sim_params, n_trials=n_t)
 
-                print(f"\nSukces! Pełny wektor targetów od {out_of_sample_df.index.min().strftime('%Y-%m-%d')} "
-                      f"do {out_of_sample_df.index.max().strftime('%Y-%m-%d')} został wygenerowany.")
-                print(f"Dane zapisano do pliku: {PREDICTIONS_FILE}")
-                print("Wyniki dla train: ", train_years, "Dla val: ", val_years, "Dla test: ", test_years)
-                # 4. EGZEKUCJA - Faza testowania na wykresie
-                evaluate_xgboost_strategy(PREDICTIONS_FILE, sim_params)
+                        orchestrator = WalkForwardOrchestrator(
+                            data_loader=loader,
+                            splitter=splitter,
+                            optimizer=optimizer,
+                            target_column=TARGET_COLUMN_NAME,
+                            sim_params=sim_params  # <--- NOWE: Przekazujemy sim_params
+                        )
 
-            val_years = val_years - 1
-        train_years= train_years + 1
+                        # <--- NOWE: Odbieramy dwa DataFrame'y
+                        out_of_sample_df, metrics_df = orchestrator.execute()
 
-    START_DATE_LEARN = '2013-01-01'
-    train_years = 2
-    while train_years < 8:
+                        PREDICTIONS_FILE = f'predictions_{start_date}_train{train_years}_val{val_years}_test{t_y}_trails{n_t}.csv'
+                        out_of_sample_df.to_csv(PREDICTIONS_FILE)
 
-        val_years = 6
+                        # <--- NOWE: Zapisywanie metryk krok po kroku
+                        METRICS_FILE = f'metrics_{start_date}_train{train_years}_val{val_years}_test{t_y}_trails{n_t}.csv'
+                        metrics_df.to_csv(METRICS_FILE, index=False)
 
-        while val_years > 0:
-            if train_years >= val_years and train_years + val_years == 7:
-                # Parametry symulatora, pod które optymalizowany będzie XGBoost oraz podpięty finalny wykres
+                        print(f"\n=======================================================")
+                        print(f"BADAŃ: Start: {start_date} | Train: {train_years}y | Val: {val_years}y | Test: {t_y}y | Trails: {n_t}")
+                        print(f"Zapisano metryki szczegółowe kroków do: {METRICS_FILE}")
+                        print(f"=======================================================")
 
-                # Układ okien z Twojego zapytania (6 lat uczenia, 2 lata walidacji, 1 rok testu)
-                splitter = WalkForwardSplitter(
-                    train_years=train_years,
-                    val_years=val_years,
-                    test_years=test_years,
-                    expanding_window=True,
-                    start_date = START_DATE_LEARN
-                )
-
-                # Optymalizator
-                optimizer = XGBoostOptunaOptimizer(
-                    simulator_params=sim_params,
-                    n_trials=n_trials
-                )
-
-                # Orkiestrator
-                orchestrator = WalkForwardOrchestrator(
-                    data_loader=loader,
-                    splitter=splitter,
-                    optimizer=optimizer,
-                    target_column=TARGET_COLUMN_NAME
-                )
-
-                # 3. EGZEKUCJA - Faza uczenia i generowania sygnałów
-                out_of_sample_df = orchestrator.execute()
-
-                # Zapis finalnego zbioru sygnałów
-                out_of_sample_df.to_csv(PREDICTIONS_FILE)
-
-                print(f"\nSukces! Pełny wektor targetów od {out_of_sample_df.index.min().strftime('%Y-%m-%d')} "
-                      f"do {out_of_sample_df.index.max().strftime('%Y-%m-%d')} został wygenerowany.")
-                print(f"Dane zapisano do pliku: {PREDICTIONS_FILE}")
-                print("Wyniki dla train: ", train_years, "Dla val: ", val_years, "Dla test: ", test_years)
-                # 4. EGZEKUCJA - Faza testowania na wykresie
-                evaluate_xgboost_strategy(PREDICTIONS_FILE, sim_params)
-
-            val_years = val_years - 1
-        train_years= train_years + 1
-
-    START_DATE_LEARN = '2014-01-01'
-    while train_years < 8:
-        val_years = 6
-        while val_years > 0:
-            if train_years >= val_years and train_years + val_years == 6:
-                # Parametry symulatora, pod które optymalizowany będzie XGBoost oraz podpięty finalny wykres
-
-                # Układ okien z Twojego zapytania (6 lat uczenia, 2 lata walidacji, 1 rok testu)
-                splitter = WalkForwardSplitter(
-                    train_years=train_years,
-                    val_years=val_years,
-                    test_years=test_years,
-                    expanding_window=True,
-                    start_date = START_DATE_LEARN
-                )
-
-                # Optymalizator
-                optimizer = XGBoostOptunaOptimizer(
-                    simulator_params=sim_params,
-                    n_trials=n_trials
-                )
-
-                # Orkiestrator
-                orchestrator = WalkForwardOrchestrator(
-                    data_loader=loader,
-                    splitter=splitter,
-                    optimizer=optimizer,
-                    target_column=TARGET_COLUMN_NAME
-                )
-
-                # 3. EGZEKUCJA - Faza uczenia i generowania sygnałów
-                out_of_sample_df = orchestrator.execute()
-
-                # Zapis finalnego zbioru sygnałów
-                out_of_sample_df.to_csv(PREDICTIONS_FILE)
-
-                print(f"\nSukces! Pełny wektor targetów od {out_of_sample_df.index.min().strftime('%Y-%m-%d')} "
-                      f"do {out_of_sample_df.index.max().strftime('%Y-%m-%d')} został wygenerowany.")
-                print(f"Dane zapisano do pliku: {PREDICTIONS_FILE}")
-                print("Wyniki dla train: ", train_years, "Dla val: ", val_years, "Dla test: ", test_years)
-                # 4. EGZEKUCJA - Faza testowania na wykresie
-                evaluate_xgboost_strategy(PREDICTIONS_FILE, sim_params)
-
-            val_years = val_years - 1
-        train_years= train_years + 1
-
-    START_DATE_LEARN = '2015-01-01'
-    train_years = 2
-    while train_years < 8:
-        val_years = 6
-        while val_years > 0:
-            if train_years >= val_years and train_years + val_years == 5:
-                # Parametry symulatora, pod które optymalizowany będzie XGBoost oraz podpięty finalny wykres
-
-                # Układ okien z Twojego zapytania (6 lat uczenia, 2 lata walidacji, 1 rok testu)
-                splitter = WalkForwardSplitter(
-                    train_years=train_years,
-                    val_years=val_years,
-                    test_years=test_years,
-                    expanding_window=True,
-                    start_date = START_DATE_LEARN
-                )
-
-                # Optymalizator
-                optimizer = XGBoostOptunaOptimizer(
-                    simulator_params=sim_params,
-                    n_trials=n_trials
-                )
-
-                # Orkiestrator
-                orchestrator = WalkForwardOrchestrator(
-                    data_loader=loader,
-                    splitter=splitter,
-                    optimizer=optimizer,
-                    target_column=TARGET_COLUMN_NAME
-                )
-
-                # 3. EGZEKUCJA - Faza uczenia i generowania sygnałów
-                out_of_sample_df = orchestrator.execute()
-
-                # Zapis finalnego zbioru sygnałów
-                out_of_sample_df.to_csv(PREDICTIONS_FILE)
-
-                print(f"\nSukces! Pełny wektor targetów od {out_of_sample_df.index.min().strftime('%Y-%m-%d')} "
-                      f"do {out_of_sample_df.index.max().strftime('%Y-%m-%d')} został wygenerowany.")
-                print(f"Dane zapisano do pliku: {PREDICTIONS_FILE}")
-                print("Wyniki dla train: ", train_years, "Dla val: ", val_years, "Dla test: ", test_years)
-                # 4. EGZEKUCJA - Faza testowania na wykresie
-                evaluate_xgboost_strategy(PREDICTIONS_FILE, sim_params)
-
-            val_years = val_years - 1
-        train_years= train_years + 1
-
-    START_DATE_LEARN = '2016-01-01'
-    train_years = 2
-    while train_years < 8:
-        val_years = 6
-
-        while val_years > 0:
-            if train_years >= val_years and train_years + val_years == 4:
-                # Parametry symulatora, pod które optymalizowany będzie XGBoost oraz podpięty finalny wykres
-
-                # Układ okien z Twojego zapytania (6 lat uczenia, 2 lata walidacji, 1 rok testu)
-                splitter = WalkForwardSplitter(
-                    train_years=train_years,
-                    val_years=val_years,
-                    test_years=test_years,
-                    expanding_window=True,
-                    start_date = START_DATE_LEARN
-                )
-
-                # Optymalizator
-                optimizer = XGBoostOptunaOptimizer(
-                    simulator_params=sim_params,
-                    n_trials=n_trials
-                )
-
-                # Orkiestrator
-                orchestrator = WalkForwardOrchestrator(
-                    data_loader=loader,
-                    splitter=splitter,
-                    optimizer=optimizer,
-                    target_column=TARGET_COLUMN_NAME
-                )
-
-                # 3. EGZEKUCJA - Faza uczenia i generowania sygnałów
-                out_of_sample_df = orchestrator.execute()
-
-                # Zapis finalnego zbioru sygnałów
-                out_of_sample_df.to_csv(PREDICTIONS_FILE)
-
-                print(f"\nSukces! Pełny wektor targetów od {out_of_sample_df.index.min().strftime('%Y-%m-%d')} "
-                      f"do {out_of_sample_df.index.max().strftime('%Y-%m-%d')} został wygenerowany.")
-                print(f"Dane zapisano do pliku: {PREDICTIONS_FILE}")
-                print("Wyniki dla train: ", train_years, "Dla val: ", val_years, "Dla test: ", test_years)
-                # 4. EGZEKUCJA - Faza testowania na wykresie
-                evaluate_xgboost_strategy(PREDICTIONS_FILE, sim_params)
-
-            val_years = val_years - 1
-        train_years= train_years + 1
-
-    START_DATE_LEARN = '2017-01-01'
-    train_years = 2
-    while train_years < 8:
-        val_years = 6
-
-        while val_years > 0:
-            if train_years >= val_years and train_years + val_years == 3:
-                # Parametry symulatora, pod które optymalizowany będzie XGBoost oraz podpięty finalny wykres
-
-                # Układ okien z Twojego zapytania (6 lat uczenia, 2 lata walidacji, 1 rok testu)
-                splitter = WalkForwardSplitter(
-                    train_years=train_years,
-                    val_years=val_years,
-                    test_years=test_years,
-                    expanding_window=True,
-                    start_date = START_DATE_LEARN
-                )
-
-                # Optymalizator
-                optimizer = XGBoostOptunaOptimizer(
-                    simulator_params=sim_params,
-                    n_trials=n_trials
-                )
-
-                # Orkiestrator
-                orchestrator = WalkForwardOrchestrator(
-                    data_loader=loader,
-                    splitter=splitter,
-                    optimizer=optimizer,
-                    target_column=TARGET_COLUMN_NAME
-                )
-
-                # 3. EGZEKUCJA - Faza uczenia i generowania sygnałów
-                out_of_sample_df = orchestrator.execute()
-
-                # Zapis finalnego zbioru sygnałów
-                out_of_sample_df.to_csv(PREDICTIONS_FILE)
-
-                print(f"\nSukces! Pełny wektor targetów od {out_of_sample_df.index.min().strftime('%Y-%m-%d')} "
-                      f"do {out_of_sample_df.index.max().strftime('%Y-%m-%d')} został wygenerowany.")
-                print(f"Dane zapisano do pliku: {PREDICTIONS_FILE}")
-                print("Wyniki dla train: ", train_years, "Dla val: ", val_years, "Dla test: ", test_years)
-                # 4. EGZEKUCJA - Faza testowania na wykresie
-                evaluate_xgboost_strategy(PREDICTIONS_FILE, sim_params)
-
-            val_years = val_years - 1
-        train_years= train_years + 1
+                        evaluate_xgboost_strategy(PREDICTIONS_FILE, sim_params)

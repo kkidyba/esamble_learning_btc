@@ -27,7 +27,7 @@ def main():
 
     # --- NOWY KOD: PRZYCIĘCIE OD 2022 ROKU ---
     # Filtrujemy ramkę danych, zostawiając tylko wiersze od 1 stycznia 2022 włącznie
-    # df = df[df['Date'] >= '2020-01-01'].reset_index(drop=True)
+    df = df[df['Date'] >= '2022-01-01'].reset_index(drop=True)
 
     print(f"Dane wyrównane i przycięte. Liczba dni do symulacji: {len(df)}")
 

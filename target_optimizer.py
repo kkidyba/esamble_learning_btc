@@ -213,11 +213,11 @@ class BTCProxyOptimizer:
 
         print("\nPrzesiewam wyniki przez filtry bezpieczeństwa...")
 
-        warunek_f1 = df_results['F1_Macro'] > 0.0
-        warunek_mcc = df_results['MCC'] > 0.0
+        warunek_f1 = df_results['F1_Macro'] > 0.5
+        warunek_mcc = df_results['MCC'] > 0.1
         warunek_balans_min = df_results['Rozkład_Jedynek (%)'] >= 20.0
         warunek_balans_max = df_results['Rozkład_Jedynek (%)'] <= 80.0
-        warunek_sortino = df_results['Wynik_DCA_(Sortino)'] > 0.5
+        warunek_sortino = df_results['Wynik_DCA_(Sortino)'] > 1
 
         # Aplikujemy wszystkie 5 warunków
         df_filtered = df_results[warunek_f1 & warunek_mcc & warunek_balans_min & warunek_balans_max & warunek_sortino]
@@ -265,9 +265,9 @@ if __name__ == "__main__":
         hysteresis_k=7
     )
 
-    m_lower_test = [0.5, 1, 2, 4]
-    m_upper_test = [1, 2, 4, 8]
-    k_test = [1, 3, 6, 9, 12, 15, 18, 21, 24] # <--- NOWE: testowane wartości k (np. dla k=0.5 okno wyniesie 14, dla k=2 wyniesie 56)
+    m_lower_test = [0.5, 0.6, 0.8, 1, 1.2]
+    m_upper_test = [0.6, 0.8, 1, 1.2, 1.4, 1.6, 1.8]
+    k_test = [1, 2, 4, 8, 12, 16, 20, 24] # <--- NOWE: testowane wartości k (np. dla k=0.5 okno wyniesie 14, dla k=2 wyniesie 56)
 
     wyniki = optimizer.run_grid_search(m_lower_test, m_upper_test, k_test)
 

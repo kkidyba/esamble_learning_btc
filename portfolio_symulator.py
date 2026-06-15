@@ -174,6 +174,32 @@ class DCAPortfolioSimulator:
         final_equity = equity_curve[-1]
         roi = (final_equity / total_invested) - 1.0 if total_invested > 0 else 0
 
+        # ==========================================================
+        # NOWE: Obliczanie ROI i Sortino dla Czystego DCA (Benchmark)
+        # ==========================================================
+        pure_dca_equity, fiat_invested_curve = self._calculate_pure_dca_equity(dates_dt, prices_arr, exec_prices_arr)
+
+        dca_returns = np.zeros(n)
+        for i in range(1, n):
+            prev_equity_dca = pure_dca_equity[i - 1]
+            if prev_equity_dca > 0:
+                # Rozpoznanie, czy w danym dniu wpadła wpłata z DCA
+                dca_today_bench = fiat_invested_curve[i] - fiat_invested_curve[i - 1]
+
+                # Używamy logarytmicznej stopy zwrotu po odjęciu dopłaconego kapitału
+                num = pure_dca_equity[i] - dca_today_bench
+                if num > 0:
+                    dca_returns[i] = np.log(num / prev_equity_dca)
+                else:
+                    dca_returns[i] = 0.0
+
+        valid_dca_returns = dca_returns[1:]
+        dca_sortino = self._calculate_sortino(valid_dca_returns)
+
+        final_dca_equity = pure_dca_equity[-1]
+        dca_roi = (final_dca_equity / total_invested) - 1.0 if total_invested > 0 else 0.0
+        # ==========================================================
+
         return {
             'Sortino': sortino,
             'ROI': roi,
@@ -183,7 +209,12 @@ class DCAPortfolioSimulator:
             'Returns': true_returns,
             'BTC_Balances': btc_balances_arr,
             'Dates': dates_dt,
-            'Prices': prices_arr
+            'Prices': prices_arr,
+            # Dodane do słownika zwracanego:
+            'DCA_Sortino': dca_sortino,
+            'DCA_ROI': dca_roi,
+            'DCA_Final_Equity': final_dca_equity,
+            'Pure_DCA_Equity': pure_dca_equity
         }
 
     def _calculate_sortino(self, returns_array):
